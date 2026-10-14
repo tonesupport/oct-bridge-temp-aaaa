@@ -1,0 +1,4408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>bridge</title>
+</head>
+    <script id="global-settings-sortof">
+    function disableAnimations() {
+        document.body.classList.add("no-animations");
+    }
+
+    // Enable all animations and transitions
+    function enableAnimations() {
+        document.body.classList.remove("no-animations");
+    }
+
+
+</script>
+<script id="forth" type="text/javascript">
+// github:chocain/eforthjs616
+// modifications by inscript
+
+// dict is an global array that hold objects, each object can hold:
+// name - the string name of the word
+// xt - execution token -> the javascript logic, or the param field if no prims in xt
+// the param field is threaded code
+// pf - an array of further word objects to execute - the thread of forth instructions
+// q - an array of data items (often used for storing literal values, strings, etc.)
+// val - each immediate word links a new words val to the newly created code object's q
+// whenevre you do @, !, n@, n!, etc. you're indexing into the dict[...] entry's val array, so the dictionary itself is being used as a big "map" (by int index in dict) from word name -> value array
+// there is no separate, typed array or linear memory region, each data structure in this impl is just a property in the dict array -> this means that the forth VM is letting js handle memory
+// these forth data structures are all placeholders that reference properties in these javascript objects -> hence no memory optimizations on the forth side
+// so as they are currently implemented, variable, constant, etc. ae just sugar over the same underlying mechanism: "make a new dict entry with a single-element array to hold the data"
+'use strict';
+window.ForthVM = function(outputCallback) {
+    let SPC=' ', CR='\n', EPS=1.0e-6;
+    let startTimeVar = 0, endTimeVar = 0;
+    let _WST    = [];
+    let _RST    = [];
+    let _base   = 10; 
+    let _compi  = false;
+    let _ucase  = false;
+    let _tib    = '', _ntib = 0;
+    let _fence  = 0;
+    let outputBuffer = []; // Collect output here instead of console.log
+    let startupOutputBuffer = []; // Temporary buffer for startup script output
+
+    // Replacing direct log calls with a buffered log function
+const log = (s) => {
+    if (startupOutputBuffer) {
+        startupOutputBuffer.push(s); // Buffer startup output
+    } else {
+        outputBuffer.push(s);
+        // Restore callback invocation so output appears
+        if (outputCallback) outputCallback(s);
+    }
+};
+
+    
+    const NA  = (s)=>s+' not found! ';
+    const word= (d=SPC)=>{
+        while (d==SPC && (_tib[_ntib]==SPC || _tib[_ntib]=='\t')) _ntib++;
+        let i = _tib.indexOf(d, _ntib);
+        let s = (i==-1) ? (_tib='',null) : _tib.substring(_ntib, i);
+        _ntib = i+1;
+        return s;
+    };
+    const dot_r = (n, v)=>{
+        let s = v.toString(_base);
+        for(let i=0; i+s.length < n; i++) log(SPC);
+        log(s);
+    };
+    const sleep=(ms)=> new Promise(RST=>setTimeout(RST,ms));
+
+    const INT    = v=>(v | 0);
+    const UINT   = v=>(v >>> 0);
+    const BOOL   = t=>(t ? -1 : 0); // true/false values here
+    const ZERO   = v=>BOOL(Math.abs(v) < EPS);
+    const top    = (n=1)=>_WST.at(-INT(n));
+    const push   = v=>_WST.push(v);
+    const pop    = () => {
+        if (_WST.length === 0) {
+            throw 'Error: stack underflow';
+        }
+        return _WST.pop();
+    };
+    const grab   = n=>{ let v=top(n); _WST.splice(_WST.length - INT(n), 1); return v; };
+    const dec_i  = () =>_RST[_RST.length - 1] -= 1;
+
+    const _docon = c=>push(c.q[0]);
+    const _dovar = c=>push(c.token);
+    const _dolit = c=>push(c.q[0]);
+    const _dotstr= c=>log(c.q[0]);
+    const _dostr = c=>{
+        let s = dict[c.token >> 16].pf[c.token & 0xffff].q[0];
+        push(s); push(s.length);
+    };
+    const _tor   = c=>_RST.push(pop());
+    const _bran  = c=>_run(ZERO(pop()) ? c.p1 : c.pf);
+
+    const _run = p=>{
+        try { p.forEach(w=>w.exec()) } catch {}
+    };
+
+    const _cycle = c=>{
+        while (true) {
+            _run(c.pf);
+            if (c.stage==0 && INT(pop())!=0) break;
+            if (c.stage==1) continue;
+            if (c.stage==2 && ZERO(pop())) break;
+            _run(c.p1);
+        }
+    };
+
+    const _dofor = c=>{
+        do { _run(c.pf) } while (c.stage==0 && dec_i() >= 0);
+        while (c.stage>0) {
+            _run(c.p2);
+            if (dec_i() < 0) break;
+            _run(c.p1);
+        }
+        _RST.pop();
+    };
+    const _does  = c=>{
+        let hit = false;
+        dict[c.token].pf.forEach(w=>{
+            if (hit) dict.at(-1).pf.push(w);
+            if (w.name=='_does') hit = true;
+        });
+        throw '_does'
+    };
+
+    const _spaces= (n=1)=>{ for (let i=0; i<n; i++) log(SPC) };
+
+    const _words = () => {
+        const terminalWidth = 40;
+        const maxWordLength = dict.reduce((max, w) => Math.max(max, w.name.length), 0);
+        const columnWidth = maxWordLength + 2;
+        const numColumns = Math.floor(terminalWidth / columnWidth) || 1;
+        let output = '';
+
+        dict.forEach((w, index) => {
+            let wordStr = w.name.padEnd(columnWidth, ' ');
+            output += wordStr;
+            if ((index + 1) % numColumns === 0) {
+                output = output.trimEnd();
+                output += CR;
+            }
+        });
+        if (!output.endsWith(CR)) {
+            output = output.trimEnd();
+           // output += CR;
+        }
+        log(output);
+    };
+
+    const _dump = (idx, n)=>{
+        for (let i=INT(idx); i < INT(idx+n); i++) {
+            if (i >= dict.length) break;
+            let w = dict[i];
+            log('['+i+(w.immd ? ']*=' : ']="') + w.name + '", ');
+            if (w.xt) log(w.xt);
+            else      log('pf='+JSON.stringify(w.pf));
+            //log(CR);
+        }
+    };
+    const _see = (w, n=0)=>{
+        const iden = (n, s)=>{ log(CR); _spaces(2*n); log(s) };
+        const show = (hdr, pf)=>{
+            if (pf == null || pf.length == 0) return;
+            if (hdr!='') iden(n, hdr);
+            iden(n+1, '');
+            pf.forEach(w1=>_see(w1, n+1));
+        };
+        let cn = w.pf!=null && w.pf.length>0;
+        log(' '+w.name+(cn ? ' {' : ''));
+        if (w.q != null) {
+            let qn = w.q.length;
+            if (qn > 1) log(JSON.stringify(w.q));
+            else {
+                log(w.q[0].toString());
+                if (typeof(w.q[0])=='string') log('"');
+            }
+        }
+        if (w.xt && n==0) {
+            log(' { '+w.xt+' } ');
+            return;
+        }
+        let bn = w.stage==2 ? ' _while' : (w.stage==3 ? ' _aft' : ' _else');
+        show('', w.pf);
+        show(bn, w.p1);
+        show(' _then', w.p2);
+        if (cn) log(' }');
+    };
+
+    class Prim {
+        constructor(name, xt) {
+            this.name  = name;
+            this.xt    = xt;
+            this.immd  = false;
+            this.token = _fence++;
+        }
+        exec() { this.xt(this) }
+    }
+    class Immd extends Prim {
+        constructor(name, xt) { super(name, xt); this.immd=true }
+    }
+    class Code {
+        constructor(name, xt, v=false) {
+            this.name  = name;
+            this.xt    = xt;
+            this.immd  = false;
+            this.pf    = [];
+            if (typeof(v)=='boolean' && v) {
+                this.token = _fence++;
+            } else if (typeof(v)=='string') this.q = [ v ];
+            else if (typeof(v)=='number') this.q = [ v ];
+        }
+        exec() {
+            if (this.xt == null) _run(this.pf);
+            else this.xt(this);
+        }
+    }
+
+    const compile= (w)=>dict.at(-1).pf.push(w);
+    const nvar   = (xt, v)=>{
+        let t = dict.at(-1);
+        let w = new Code('', xt, v);
+        t.val   = w.q;
+        w.token = t.token;
+        compile(w);
+    };
+    const find   = (s)=>{
+        for (let i=dict.length-1; i>=0; --i) {
+            if (s.localeCompare(
+                dict[i].name, undefined,
+                { sensitivity: _ucase ? 'case' : 'base' }
+            )==0) {
+                return dict[i];
+            }
+        }
+        return null;
+    };
+    const tok2w  = ()=>{
+        let s=word();
+        if (s==null) { log('name? '); throw 'need name' }
+        let w = find(s);
+        if (w==null) throw NA(s);
+        return w;
+    };
+    const isNum = (s)=>{
+        const mx = (c)=>c+'-'+String.fromCharCode(c.charCodeAt() + (_base - 11));
+        const st = _base > 10
+              ? '^-?[0-9|'+mx('a')+'|'+mx('A')+']+$'
+              : '^-?([0-'+(_base-1).toString()+']*[.])?[0-'+(_base-1).toString()+']+$';
+        return new RegExp(st).test(s);
+    };
+    const merge = (dst, src)=>{ dst.push(...src); src.length = 0 };
+
+    let dict = [
+        new Prim('dup',   c=>push(top(1))),
+        new Prim('drop',  c=>pop()),
+        new Prim('over',  c=>push(top(2))),
+        new Prim('swap',  c=>push(grab(2))),
+        new Prim('rot',   c=>push(grab(3))),
+        new Prim('pick',  c=>{ let i=pop(), n=top(i+1); push(n) }),
+        new Prim('roll',  c=>{ let i=pop(), n=grab(i+1); push(n) }),
+        new Prim('nip',   c=>grab(2)),
+        new Prim('+',     c=>{ let n=pop(); push(pop() + n) }),
+        new Prim('-',     c=>{ let n=pop(); push(pop() - n) }),
+        new Prim('*',     c=>{ let n=pop(); push(pop() * n) }),
+        new Prim('/',     c=>{ let n=pop(); push(pop() / n) }),
+        new Prim('mod',   c=>{ let n=pop(); push(pop() % n) }),
+        new Prim('divmod',c=>{ let n=pop(), m=pop(); 
+                               push((m / n)); push(m % n)}),
+        new Prim('*/',    c=>{ let n=pop(); push(pop() * pop() / n) }),
+        new Prim('*/mod', c=>{
+            let n=pop(), m=pop() * pop();
+            push(m % n); push(INT(m / n))
+        }),
+        new Prim('int',   c=>push(INT(pop()))),
+        new Prim('and',   c=>push(pop() & pop())),
+        new Prim('or',    c=>push(pop() | pop())),
+        new Prim('xor',   c=>push(pop() ^ pop())),
+        new Prim('negate',c=>push(-pop())),
+        new Prim('invert',c=>push(~pop())),
+        new Prim('abs',   c=>push(Math.abs(pop()))),
+        new Prim('rshift',c=>{ let n=pop(); push(pop() >> n) }),
+        new Prim('lshift',c=>{ let n=pop(); push(pop() << n) }),
+        new Prim('shift', c => {
+		    let n = pop(); // Pop the number of positions to shift
+    		if (n === 0) { return;} else if (n > 0) {
+        	push(pop() >> n); } else {
+        	push(pop() << (-n));}}),
+        new Prim('=',     c=>{ let n=pop(); push(ZERO(pop() - n)) }),
+        new Prim('<',     c=>{ let n=pop(); push(BOOL((pop() - n) < -EPS)) }),
+        new Prim('>',     c=>{ let n=pop(); push(BOOL((pop() - n) >  EPS)) }),
+        new Prim('uint', c => push(UINT(pop()))),
+        // new Prim('ucase!',c=>_ucase=BOOL(ZERO(pop()))),
+        // new Prim('base@', c=>push(INT(_base))),
+        // new Prim('base!', c=>_base=INT(pop())),
+        // new Prim('decimal',c=>_base=10),
+        // new Prim('hex',   c=>_base=16),
+        new Prim('bl',    c=>log(SPC)),
+        new Prim('cr',    c=>log(CR)),
+        new Prim('.',     c=>log(pop().toString(_base)+SPC)),
+        new Prim('u.',    c=>log(UINT(pop()).toString(_base)+SPC)),
+        new Prim('.r',    c=>{ let n=pop(); dot_r(n, pop()) }),
+        new Prim('u.r',   c=>{ let n=pop(); dot_r(n, UINT(pop())) }),
+        new Prim('key',   c=>push(word()[0])),
+        new Prim('emit',  c=>log(String.fromCharCode(pop()))),
+        new Prim('space', c=>log(SPC)),
+        new Prim('spaces',c=>_spaces(pop())),
+        new Prim('type',  c=>{ let len=pop(); let str=pop(); log(str.substring(0, len)) }),
+        new Immd('."',    c=>{
+            let s = word('"');
+            if (s==null) { log('one quote? '); return }
+            if (_compi) compile(new Code('." ', _dotstr, s))
+            else log(s)
+        }),
+        new Immd('s"',    c=>{
+            let s = word('"');
+            if (s==null) { log('one quote? '); return }
+            if (_compi) {
+                let w = new Code('s" ', _dostr, s);
+                let n = dict.at(-1);
+                w.token = (n.token<<16) | n.pf.length;
+                compile(w);
+            }
+            else { push(s); push(s.length) }
+        }),
+        new Immd('(',     c=>word(')')),
+        new Immd('.(',    c=>log(word(')'))),
+        new Immd('\\',    c=>_ntib=_tib.length),
+        new Immd('if',    c=>{
+            let w = new Code('_if', _bran, false)
+            compile(w); w.p1=[]; w.stage=0
+            dict.push(new Code(' tmp'))
+        }),
+        new Immd('else',  c=>{
+            let w=dict.last(), tmp=dict.at(-1)
+            merge(w.pf, tmp.pf); w.stage=1
+        }),
+        new Immd('then',  c=>{
+            let w=dict.last(), tmp=dict.at(-1)
+            if (w.stage==0) {
+                merge(w.pf, tmp.pf)
+                dict.pop()
+            }
+            else {
+                merge(w.p1, tmp.pf)
+                if (w.stage==1) dict.pop()
+            }
+        }),
+        new Immd('begin', c=>{
+            let w = new Code('_begin', _cycle, false)
+            compile(w); w.p1=[]; w.stage=0
+            dict.push(new Code(' tmp'))
+        }),
+        new Immd('while', c=>{
+            let w=dict.last(), tmp=dict.at(-1)
+            merge(w.pf, tmp.pf); w.stage=2
+        }),
+        new Immd('repeat', c=>{
+            let w=dict.last(), tmp=dict.at(-1)
+            merge(w.p1, tmp.pf); dict.pop()
+        }),
+        new Immd('again', c=>{
+            let w=dict.last(), tmp=dict.at(-1)
+            merge(w.pf, tmp.pf); dict.pop(); w.stage=1
+        }),
+        new Immd('until', c=>{
+            let w=dict.last(), tmp=dict.at(-1)
+            merge(w.pf, tmp.pf); dict.pop()
+        }),
+        new Immd('for',   c=>{
+            compile(new Code('>r', _tor, false));
+            let w = new Code('_for', _dofor, false)
+            compile(w); w.p1=[]; w.stage=0
+            dict.push(new Code(' tmp'))
+        }),
+        new Immd('aft',   c=>{
+            let w=dict.last(), tmp=dict.at(-1)
+            merge(w.pf, tmp.pf); w.p2=[]; w.stage=3
+        }),
+        new Immd('next', c => {
+            if (_RST.length < 2) {
+                log('Error: Return stack underflow in next');
+                throw 'Return stack underflow';
+            }
+
+            let loopCounter = _RST.pop();
+            let loopLimit = _RST.pop();
+
+            loopCounter += 1;
+            if (loopCounter < loopLimit) {
+                _RST.push(loopLimit);
+                _RST.push(loopCounter);
+                throw 'loop';
+            }
+        }),
+        new Prim('rpush',    c=>_RST.push(pop())), // >r
+        new Prim('rpop',    c=>push(_RST.pop())), // r>
+        new Prim('rtos',    c=>push(_RST.at(-1))), // r@
+        new Prim('depth', c=>push(_WST.length)),
+        new Prim('exit',  c=>{ throw 'exit' }),
+        new Prim('?',     c=>log(dict[pop()].val[0].toString(_base)+SPC)),
+        // pops value associated with key -- for inspecting variables
+        // potentially equivalent to : ? @  . ;
+        new Prim('@',     c=>push(dict[pop()].val[0])),
+        // pops key from tos, retrieves value from dict
+        new Prim('!',     c=>{ let w=pop(); dict[w].val[0]=pop() }),
+        // ( value key -- ) assigns value to key in dict
+        // new Prim('+!',    c=>{ let w=pop(); dict[w].val[0]+=pop() }), 
+        new Prim('n@',    c=>{ let i=pop(); let w=pop(); push(dict[w].val[i]) }),
+        // ( i w -- value ) pops index i and key w, retreieves i-th element from dict[w].val -> tos
+        new Prim('n!',    c=>{ let i=pop(); let w=pop(); dict[w].val[i]=pop() }),
+        // ( x i w -- ) assigns value x to i-th element at key w 
+        new Immd('[',        c=>_compi=false ),
+        // switches interpreter from compile mode to interpret mode
+        new Prim(']',        c=>_compi=true ),
+        // switches interpreter from interpret mode to compile mode
+        new Prim("'",        c=>{ let w=tok2w(); push(w.token) }),
+        // parses next word token and pushes its token/identifer onto WST, compiles a reference to the word
+        new Immd('exec',     c=>dict[pop()].exec()),
+        // executes word, allows users to execute words immediately dring compilation/interpretation
+        new Prim(':',        c=>_compi=dict.colon()),
+        new Immd(';',        c=>_compi=false),
+        new Immd('variable', c=>dict.colon() ? nvar(_dovar, 0) : null),
+        //defines new variable with initial val of 0 if in a word def
+        new Immd('constant', c=>dict.colon() ? nvar(_docon, pop()) : null),
+        new Prim("create",   c=>dict.colon()),
+        new Prim(',',        c=>{
+            let pf = dict.at(-1).pf
+            if (pf.length) pf[0].q.push(pop())
+            else           nvar(_dovar, pop())
+        }),
+        new Prim('allot',    c=>{
+            let w = dict.at(-1); nvar(_dovar, 0)
+            for (let n=pop(), i=1; i<n; i++) w.val[i]=0
+        }),
+        new Immd('does>',    c=>{
+            let w = new Code('_does', _does, false)
+            w.token = dict.at(-1).token;
+            compile(w)
+        }),
+        new Prim('to',       c=>tok2w().val[0]=pop()),
+        new Prim('is',       c=>{
+            if (!dict.colon()) return
+            let n = INT(pop()), w = dict.at(-1), s = dict[n]
+            w.pf = s.pf; w.xt = s.xt
+        }),
+        new Prim('here',     c=>push(dict.at(-1).token)),
+        new Prim('.s',       c=>{ log(JSON.stringify(_WST)) }),
+        new Prim('words',    c=>_words()),
+        new Prim('dump',     c=>{ let n=pop(); _dump(pop(), n) }),
+        new Prim('see',      c=>{
+            let w=tok2w(); _see(w); //log(CR); // console.log(w); 
+        }),
+        new Prim('forget',   c=>{
+            _fence=Math.max(tok2w().token, find('boot').token+1)
+            //console.log("_fence"+_fence.toString())
+            dict.splice(_fence)
+        }),
+        new Prim('abort',    c=>{ _RST.length = _WST.length = 0 }),
+        new Prim('ms',       c=>{ let n = Date.now(); push(n) }),
+        new Prim('delay',    c=>sleep(pop()).then(()=>{})),
+        new Prim('date',     c=>push((new Date()).toDateString())),
+        new Prim('time',     c=>push((new Date()).toLocaleTimeString())),
+        new Prim('eval',     c=>eval(pop())),
+        new Prim('boot',     c=>{
+            dict.splice(_fence=find('boot').token+1)
+            _RST.length = _WST.length = 0
+            _base = 10
+            log(`Ready`);
+        })
+    ];
+
+    dict.colon = function() {
+        let s = word();
+        if (s==null) { log('name? '); return false }
+        if (find(s) != null) log(s + ' redefined')
+        dict.push(new Code(s, null, true))
+        return true
+    };
+    dict.last = function() { return dict.at(-2).pf.at(-1) };
+
+    this.WST = _WST;
+    this.RST = _RST;
+    this.dict = dict;
+    this.base = ()=>{ return _base };
+
+    this.outer = (tok)=>{
+        let w = find(tok);
+        if (w != null) {
+            if (!_compi || w.immd) {
+                try {
+                    w.exec();
+                } catch (e) {
+                    log(e);
+                    //log('\n')
+                }
+            } else {
+                compile(w);
+            }
+            return;
+        }
+        let n = _base!=10 ? parseInt(tok, _base) : parseFloat(tok);
+        if (isNaN(n) || !isNum(tok)) {
+            log('Error: undefined word');
+            _compi = false;
+            return;
+        }
+        else if (_compi) {
+            compile(new Code('', _dolit, n))
+        }
+        else push(n)
+    };
+
+    this.exec = (cmd)=>{
+        // Clear output before each exec
+        outputBuffer.length = 0;
+        cmd.split('\n').forEach(r=>{
+            _tib=r + SPC; _ntib=0;
+            let tok = '';
+            while ((tok=word()) != null) {
+                this.outer(tok)
+            }
+        });
+    };
+
+    // Get the current output and clear the buffer
+    this.getOutput = () => outputBuffer.join('');
+        
+    // Automatically load and execute the startup script
+    const startupScriptElement = document.getElementById('forth-startup-code');
+    if (startupScriptElement && startupScriptElement.type === 'application/forth') {
+        const startupScript = startupScriptElement.textContent.trim();
+        if (startupScript) {
+            try {
+                this.exec(startupScript);
+            } catch (e) {
+                console.error("Error executing startup script:", e);
+            }
+        }
+    }
+
+    // Flush buffered startup output
+    if (startupOutputBuffer.length > 0) {
+        startupOutputBuffer.forEach((line) => {
+            outputBuffer.push(line);
+            if (outputCallback) outputCallback(line);
+        });
+        startupOutputBuffer = null; // Clear temporary buffer
+    }
+};
+
+</script>
+<
+<script id="optional-prims">
+( todo: trim blanks on "SEE", "SEE" creates unnecessary nulls? )
+: inc 1 + ;
+: dec 1 - ;
+: max 2dup - abs + 2 / ;
+: min 2dup - abs - 2 / ;
+: 2dup ( x1 x2 -- x1 x2 x1 x2) over over ;
+: 2drop ( x1 x2 -- ) drop drop ; )
+: 2over ( x1 x2 x3 x4 -- x1 x2 x3 x4 x1 x2 ) 3 pick 3 pick ; 
+: 2swap ( x1 x2 x3 x4 -- x3 x4 x1 x2 ) >r >r swap r> r> swap ; 
+</script>
+
+<script id="forth-startup-code" type="application/forth">
+boot
+: inc 1 + ;
+: dec 1 - ;
+: 2dup ( x1 x2 -- x1 x2 x1 x2 ) over over ;
+: max 2dup - abs + 2 / ;
+: min 2dup - abs - 2 / ;
+: eq = ;
+: neq = ! ;
+: u< ( u1 u2 -- f ) uint swap uint < ;
+: u> ( u1 u2 -- f ) uint swap uint > ;
+: get @ ; : set ! ; ( playing with names - comfortable with indirection slowdown for now) 
+: +! ( value key -- ) @ + ! ;
+.s
+</script>
+
+<style id="winbox-css">
+@keyframes wb-fade-in {
+    0% {
+        opacity: 0;
+    }
+    to {
+        opacity: 0.85;
+    }
+}
+.no-animations * {
+    animation: none !important;
+    transition: none !important;
+}
+
+.winbox {
+    position: fixed;
+    left: 0;
+    top: 25px;
+    background: #0050ff;
+    box-shadow: 0 0 0 rgba(0,0,0,.25), 0 0 0 rgba(0,0,0,.22);
+    transition: width 0.1s,height 0.1s,left 0.1s,top 0.1s;
+    transition-timing-function: cubic-bezier(.3,1,.3,1);
+    contain: layout size;
+    text-align: left;
+    touch-action: none;
+    padding: 10px;
+    box-sizing: border-box;
+}
+.wb-body,
+.wb-header {
+    position: absolute;
+    left: 0;
+}
+.wb-header {
+    top: 0px;
+    width: 100%;
+    height: 0px;
+    line-height: 25px;
+    overflow: hidden;
+    z-index: 1;
+    background-color: #DDDDDDFF; /* title bar color */
+}
+.wb-body {
+    top: 0px;
+    right: 0;
+    bottom: 0;
+    overflow: auto;
+    -webkit-overflow-scrolling: touch;
+    overflow-scrolling: touch;
+    will-change: contents;
+    background: #fff;
+    margin-top: 0!important;
+    contain: strict;
+    z-index: 0;
+}
+
+/*hide header on max */
+.winbox.max .wb-header{
+    height: 0%;
+}
+
+/* Ensure the header is visible on minimized windows */
+.winbox.min .wb-header {
+    height: 25px; /* Match the original header height */
+    display: block; /* Ensure it is displayed */
+    line-height: 25px; /* Maintain proper alignment */
+    overflow: hidden; /* Prevent content overflow */
+}
+
+/* Hide the body content when minimized */
+.winbox.min .wb-body {
+    display: none; /* Hide the main content */
+}
+
+/* Ensure the minimized window is compact */
+.winbox.min {
+    height: 25px; /* Match the header height */
+    width: auto; /* Allow width to adjust dynamically based on content */
+    top: auto; /* Adjust position if necessary */
+    bottom: 0; /* Position at the bottom of the screen */
+    left: auto; /* Allow positioning logic to handle left alignment */
+    right: auto; /* Allow positioning logic to handle right alignment */
+    box-shadow: none; /* Simplify the appearance */
+}
+
+/* Ensure proper cursor for minimized windows */
+.winbox.min .wb-drag {
+    cursor: pointer; /* Allow click to restore or move */
+}
+
+/* Example for better visibility of minimized windows */
+.winbox.min {
+    background: #f0f0f0; /* Lighter background for minimized state */
+    border: 1px solid #ccc; /* Add a border for clarity */
+}
+
+/* ////////////////////////////////////////////////////////// */
+
+.wb-control *,
+.wb-icon {
+    background-repeat: no-repeat;
+}
+.wb-drag {
+    height: 100%;
+    padding-left: 10px;
+    cursor: move;
+}
+.wb-title {
+    font-family: monospace;
+    font-size: 16px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: #000; /* title text color */
+    padding-top: 3px;
+}
+.wb-icon {
+    display: none;
+    width: 20px;
+    height: 100%;
+    margin: -1px 8px 0-3px;
+    float: left;
+    background-size: 100%;
+    background-position: center;
+}
+.wb-e,
+.wb-w {
+    width: 10px;
+    top: 0;
+}
+.wb-n,
+.wb-s {
+    left: 0;
+    height: 10px;
+    position: absolute;
+}
+.wb-n {
+    top: -25px;
+    right: 0;
+    cursor: n-resize;
+    z-index: 2;
+}
+.wb-e {
+    position: absolute;
+    right: -5px;
+    bottom: 0;
+    cursor: w-resize;
+    z-index: 2;
+}
+.wb-s {
+    bottom: -5px;
+    right: 0;
+    cursor: n-resize;
+    z-index: 2;
+}
+.wb-nw,
+.wb-sw,
+.wb-w {
+    left: -5px;
+}
+.wb-w {
+    position: absolute;
+    bottom: 0;
+    cursor: w-resize;
+    z-index: 2;
+}
+.wb-ne,
+.wb-nw,
+.wb-sw {
+    width: 15px;
+    height: 15px;
+    z-index: 2;
+    position: absolute;
+}
+.wb-nw {
+    top: -5px;
+    cursor: crosshair;
+}
+.wb-ne,
+.wb-sw {
+    cursor: ne-resize;
+}
+.wb-ne {
+    top: -5px;
+    right: -5px;
+}
+.wb-se,
+.wb-sw {
+    bottom: -5px;
+}
+.wb-se {
+    position: absolute;
+    right: -5px;
+    width: 15px;
+    height: 15px;
+    cursor: nw-resize;
+    z-index: 2;
+}
+.wb-control {
+    float: right;
+    height: 100%;
+    max-width: 100%;
+    text-align: center;
+}
+.wb-control * {
+    display: inline-block;
+    width: 30px;
+    height: 100%;
+    max-width: 100%;
+    background-position: center;
+    cursor: pointer;
+}
+.no-close .wb-close,
+.no-full .wb-full,
+.no-header .wb-header,
+.no-max .wb-max,
+.no-min .wb-min,
+.no-resize .wb-body~div,
+.wb-body .wb-hide,
+.wb-show,
+.winbox.hide,
+.winbox.min .wb-body > *,
+.winbox.min .wb-full,
+.winbox.min .wb-min,
+.winbox.modal .wb-full,
+.winbox.modal .wb-max,
+.winbox.modal .wb-min {
+    display: none;
+}
+.winbox.max .wb-drag,
+.winbox.min .wb-drag {
+    cursor: default;
+}
+.wb-min, .wb-max, .wb-close, .wb-full {
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    display: inline-block;
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+    margin: 2.5px 2.5px;
+}
+
+.wb-min {
+    background-color: #708090;
+}
+
+.wb-max {
+    background-color: #EE82EE;
+}
+
+.wb-close {
+    background-color: #FF6347;
+    margin-right: 5px;
+}
+
+.wb-full {
+    background-color: #40E0D0;
+}
+
+.winbox.max .wb-body~div,
+.winbox.min .wb-body~div,
+.winbox.modal .wb-body~div,
+.winbox.modal .wb-drag,
+body.wb-lock iframe {
+    pointer-events: none;
+}
+.winbox.max {
+    box-shadow: none;
+}
+.winbox.max .wb-body {
+    margin: 0!important !important;
+}
+
+.winbox iframe {
+    position: absolute;
+    width: 100%;
+    height: 100%;
+    border: 0;
+}
+body.wb-lock .winbox {
+    will-change: left,top,width,height;
+    transition: none;
+}
+body.wb-lock .winbox {
+    transition: none !important; /* Disable transitions during drag on headerless*/
+}
+.winbox.modal:before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: inherit;
+    border-radius: inherit;
+}
+.winbox.modal:after {
+    content: "";
+    position: absolute;
+    top: -50vh;
+    left: -50vw;
+    right: -50vw;
+    bottom: -50vh;
+    background: #0d1117;
+    animation: wb-fade-in 0.2s ease-out forwards;
+    z-index: -1;
+}
+.no-animation {
+    transition: none;
+}
+.no-shadow {
+    box-shadow: none;
+}
+.no-header .wb-body {
+    top: 0;
+}
+.no-move:not(.min) .wb-title {
+    pointer-events: none;
+}
+.wb-body .wb-show {
+    display: revert;
+
+}
+</style>
+<style id="winbox-themes">
+
+.winbox.white {
+background:#fff
+}
+
+.winbox.white .wb-title {
+color:#fff
+}
+
+.winbox.white .wb-control {
+}
+
+</style>
+<script id="winbox">
+(function() {
+    'use strict';
+    
+    var e, aa = document.createElement("div");
+    aa.innerHTML = "<div class=wb-header><div class=wb-control><span class=wb-min></span><span class=wb-max></span><span class=wb-full></span><span class=wb-close></span></div><div class=wb-drag><div class=wb-icon></div><div class=wb-title></div></div></div><div class=wb-body></div><div class=wb-n></div><div class=wb-s></div><div class=wb-w></div><div class=wb-e></div><div class=wb-nw></div><div class=wb-ne></div><div class=wb-se></div><div class=wb-sw></div>";
+
+    function h(a, b, c, f) {
+        a && a.addEventListener(b, c, f || !1)
+    }
+
+    function k(a, b) {
+        var c = window,
+            f = l;
+        c && c.removeEventListener(a, b, f || !1)
+    }
+
+    function m(a, b) {
+        a.stopPropagation();
+        b && a.preventDefault()
+    }
+
+    function t(a, b, c) {
+        c = "" + c;
+        a["_s_" + b] !== c && (a.style.setProperty(b, c), a["_s_" + b] = c)
+    };
+    /*
+     self.max &&*/
+    var u = [],
+        x = [],
+        ba = {
+            capture: !0,
+            passive: !1
+        },
+        l = {
+            capture: !0,
+            passive: !0
+        },
+        A, ea = 0,
+        B = 10,
+        E, F, fa, J, K, ha;
+
+    function P(a, b) {
+        if (!(this instanceof P)) return new P(a);
+        A || ia();
+        if (a) {
+            if (b) {
+                var c = a;
+                a = b
+            }
+            if ("string" === typeof a) c = a;
+            else {
+                var f = a.id;
+                var d = a.index;
+                var n = a.root;
+                var p = a.template;
+                c = c || a.title;
+                var v = a.icon;
+                var L = a.mount;
+                var Q = a.html;
+                var g = a.url;
+                var q = a.width;
+                var r = a.height;
+                var w = a.minwidth;
+                var C = a.minheight;
+                var y = a.maxwidth;
+                var z = a.maxheight;
+                var ca = a.autosize;
+                var D = a.overflow;
+                var G = a.min;
+                var H = a.max;
+                var I = a.hidden;
+                var da = a.modal;
+                var W = a.x || (da ? "center" : 0);
+                var X = a.y || (da ? "center" : 0);
+                var M = a.top;
+                var N = a.left;
+                var R = a.bottom;
+                var S = a.right;
+                var ja = a.background;
+                var O = a.border;
+                var T = a.header;
+                var Y = a["class"];
+                var ka = a.oncreate;
+                var pa = a.onclose;
+                var qa = a.onfocus;
+                var ra = a.onblur;
+                var sa = a.onmove;
+                var ta = a.onresize;
+                var ua = a.onfullscreen;
+                var va = a.onmaximize;
+                var wa = a.onminimize;
+                var xa = a.onrestore;
+                var ya = a.onhide;
+                var za = a.onshow;
+                var Aa = a.onload
+            }
+        }
+        this.g = (p || aa).cloneNode(!0);
+        this.g.id = this.id = f || "winbox-" + ++ea;
+        this.g.className = "winbox" + (Y ? " " + ("string" === typeof Y ? Y : Y.join(" ")) : "") + (da ? " modal" : "");
+        this.g.winbox = this;
+        this.window = this.g;
+        this.body = this.g.getElementsByClassName("wb-body")[0];
+        this.h = T || 25;
+        x.push(this);
+        ja && this.setBackground(ja);
+        O ? t(this.body, "margin", O + (isNaN(O) ? "" : "px")) : O = 0;
+        T && (b = this.g.getElementsByClassName("wb-header")[0], t(b, "height", T + "px"), t(b, "line-height", T + "px"), t(this.body, "top", T + "px"));
+        c && this.setTitle(c);
+        v && this.setIcon(v);
+        L ? this.mount(L) : Q ? this.body.innerHTML = Q : g && this.setUrl(g, Aa);
+        M = M ? U(M, K) : 0;
+        R = R ? U(R, K) : 0;
+        N = N ? U(N, J) : 0;
+        S = S ? U(S, J) : 0;
+        c = J - N - S;
+        v = K - M - R;
+        y = y ? U(y, c) : c;
+        z = z ? U(z, v) : v;
+        w = w ? U(w,
+            y) : 150;
+        C = C ? U(C, z) : this.h;
+        ca ? ((n || A).appendChild(this.body), q = Math.max(Math.min(this.body.clientWidth + 2 * O + 1, y), w), r = Math.max(Math.min(this.body.clientHeight + this.h + O + 1, z), C), this.g.appendChild(this.body)) : (q = q ? U(q, y) : Math.max(y / 2, w) | 0, r = r ? U(r, z) : Math.max(z / 2, C) | 0);
+        W = W ? U(W, c, q) : N;
+        X = X ? U(X, v, r) : M;
+        this.x = W;
+        this.y = X;
+        this.width = q;
+        this.height = r;
+        this.normalX = this.x; // Store initial x position as normal
+        this.normalY = this.y; // Store initial y position as normal
+        this.normalWidth = this.width; // Store initial width as normal
+        this.normalHeight = this.height; // Store initial height as normal
+        this.splitState = null; // Track the current split state
+        this.s = w;
+        this.o = C;
+        this.m = y;
+        this.l = z;
+        this.top = M;
+        this.right = S;
+        this.bottom = R;
+        this.left = N;
+        this.index = d;
+        this.j = D;
+        this.focused = this.hidden = this.full = this.max = this.min = !1;
+        this.onclose = pa;
+        this.onfocus = qa;
+        this.onblur = ra;
+        this.onmove = sa;
+        this.onresize = ta;
+        this.onfullscreen = ua;
+        this.onmaximize = va;
+        this.onminimize = wa;
+        this.onrestore = xa;
+        this.onhide = ya;
+        this.onshow = za;
+        I ? this.hide() : this.focus();
+        if (d || 0 === d) this.index = d, t(this.g, "z-index", d), d > B && (B = d);
+        H ? this.maximize() : G ? this.minimize() : this.resize().move();
+        la(this);
+        (n || A).appendChild(this.g);
+        ka && ka.call(this, a)
+    }
+    P["new"] = function(a) {
+        return new P(a)
+    };
+    P.stack = function() {
+        return x
+    };
+
+    function U(a, b, c) {
+        "string" === typeof a && ("center" === a ? a = (b - c) / 2 + .5 | 0 : "right" === a || "bottom" === a ? a = b - c : (c = parseFloat(a), a = "%" === ("" + c !== a && a.substring(("" + c).length)) ? b / 100 * c + .5 | 0 : c));
+        return a
+    }
+
+    function ia() {
+        A = document.body;
+        A[F = "requestFullscreen"] || A[F = "msRequestFullscreen"] || A[F = "webkitRequestFullscreen"] || A[F = "mozRequestFullscreen"] || (F = "");
+        fa = F && F.replace("request", "exit").replace("mozRequest", "mozCancel").replace("Request", "Exit");
+        h(window, "resize", function() {
+            ma();
+            na()
+        });
+        h(A, "mousedown", function() {
+            ha = !1
+        }, !0);
+        h(A, "mousedown", function() {
+            if (!ha) {
+                var a = x.length;
+                if (a)
+                    for (--a; 0 <= a; a--) {
+                        var b = x[a];
+                        if (b.focused) {
+                            b.blur();
+                            break
+                        }
+                    }
+            }
+        });
+        ma()
+    }
+
+    function la(a) { // SECTION - corners and interaction area
+        V(a, "drag");
+        //V(a, "n");
+        V(a, "s");
+        V(a, "w");
+        V(a, "e");
+        V(a, "nw");
+        //V(a, "ne"); -- is now max
+        V(a, "se");
+        //V(a, "sw");
+        
+        //interaction areas -- TODO: symbol/box not quite rendering in the correct spots
+        //setLayoutViaButton(a, {
+        //widthPercent: 3,
+        //heightPercent: 5,
+        //label: '⨁',
+        //labelFontSizePx: 36
+      //});
+        
+        h(a.g.getElementsByClassName("wb-min")[0], "click", function(b) {
+            m(b);
+            a.min ? a.restore().focus() : a.minimize()
+        });
+        h(a.g.getElementsByClassName("wb-max")[0], "click", function(b) {
+            m(b);
+            a.max ? a.restore().focus() : a.maximize().focus()
+        });
+        F ? h(a.g.getElementsByClassName("wb-full")[0], "click", function(b) {
+            m(b);
+            a.fullscreen().focus()
+        }) : a.addClass("no-full");
+        h(a.g.getElementsByClassName("wb-close")[0], "click", function(b) {
+            m(b);
+            a.close() || (a = null)
+        });
+        h(a.g, "mousedown", function() {
+            ha = !0
+        }, !0);
+        h(a.body, "mousedown", function() {
+            a.focus()
+        }, !0)
+        // After you remove V(a, "ne"), rewire the click handler:
+        const cornerNE = a.g.getElementsByClassName("wb-ne")[0];
+        if (cornerNE) {
+          // For a single-click: maximize or restore
+          // For Alt+click: close the window
+          h(cornerNE, 'click', function (event) {
+            event.stopPropagation();
+            event.preventDefault();
+
+            if (event.altKey) {
+              // Alt+click -> close
+              a.close();
+            } else {
+              // Normal click -> maximize or restore
+              a.max ? a.restore().focus() : a.maximize().focus();
+            }
+          });
+        }
+        const cornerSW = a.g.getElementsByClassName("wb-sw")[0];
+        if (cornerSW) {
+          h(cornerSW, 'click', function (event) {
+            event.stopPropagation();
+            event.preventDefault();
+
+            // Toggle minimize/restore behavior on click
+            if (a.min) {
+              // If already minimized, restore on click
+              a.restore().focus();
+            } else {
+              // Otherwise, minimize the window
+              a.minimize();
+            }
+          });
+        }
+// Remove the resizing function for n
+// V(a, "n"); // comment this line out or remove it
+
+const topN = a.g.getElementsByClassName("wb-n")[0];
+if (topN) {
+  // We'll check if the click lands in the center 10% of .wb-n's width,
+  // in the top half of .wb-n's height (for example).
+  h(topN, 'click', function(event) {
+    event.stopPropagation();
+    event.preventDefault();
+
+    // offsetX, offsetY = position within the .wb-n element
+    const localX = event.offsetX;
+    const localY = event.offsetY;
+
+    // The total size of .wb-n
+    const barWidth = topN.offsetWidth;   // The entire .wb-n width
+    const barHeight = topN.offsetHeight; // The entire .wb-n height
+
+    // Let's define a middle 10% horizontally
+    const regionStartX = barWidth * 0.45;
+    const regionEndX   = barWidth * 0.55;
+
+    // ...and say the top half vertically
+    const regionTopY   = 0;
+    const regionBotY   = barHeight * 0.5; // top half
+
+    // Check if the click is inside that sub-rectangle
+    if (
+      localX >= regionStartX && localX <= regionEndX &&
+      localY >= regionTopY   && localY <= regionBotY
+    ) {
+      // If so, call toggleLayout()
+      if (
+        a.associatedInterface &&
+        typeof a.associatedInterface.toggleLayout === 'function'
+      ) {
+        a.associatedInterface.toggleLayout();
+      }
+    }
+  });
+}
+}
+    
+function createInteractionArea(
+  a,
+  {
+    widthPercent = 10,
+    heightPercent = 10,
+    horizontalCenterPercent = 50,
+    verticalPercent = 0,
+    backgroundColor = 'gray',
+    opacity = '1',
+    zIndex = 9999,
+    label = '',
+    labelFontSizePx = 36,  // maximum label size
+    callback
+  } = {}
+) {
+  // 1) Create the overlay
+  const overlay = document.createElement('div');
+  overlay.style.position = 'absolute';
+  overlay.style.display = 'flex';
+  overlay.style.alignItems = 'center';
+  overlay.style.justifyContent = 'center';
+  overlay.style.backgroundColor = backgroundColor;
+  overlay.style.opacity = opacity;
+  overlay.style.zIndex = zIndex;
+  overlay.style.cursor = 'pointer';
+
+  // Insert label, but we won't finalize font-size until we see the overlay's actual dimension
+  overlay.style.fontSize = `${labelFontSizePx}px`;
+  overlay.textContent = label;
+
+  // 2) Helper for re-calc
+  const recalcOverlay = (winW, winH) => {
+    // local width & height in px
+    const overlayWidth  = winW * (widthPercent / 100);
+    const overlayHeight = winH * (heightPercent / 100);
+
+    // local top, left
+    const leftPos = (winW - overlayWidth) * (horizontalCenterPercent / 100) + (overlayWidth*2);
+    const topPos  = winH * (verticalPercent / 100);
+
+    overlay.style.width =  `${overlayWidth}px`;
+    overlay.style.height = `${overlayHeight}px`;
+    overlay.style.left =   `${leftPos}px`;
+    overlay.style.top =    `${topPos}px`;
+
+    // Scale the symbol if the overlay is smaller
+    const smallerDim = Math.min(overlayWidth, overlayHeight);
+    // We'll keep the symbol from exceeding the "ideal" labelFontSizePx
+    const actualFontSize = Math.min(smallerDim * 1, labelFontSizePx);
+    overlay.style.fontSize = `${actualFontSize}px`;
+  };
+
+  // 3) Initial calc & append
+  recalcOverlay(a.width, a.height);
+  a.g.appendChild(overlay);
+
+  // 4) Click callback
+  if (typeof callback === 'function') {
+    overlay.addEventListener('click', (evt) => {
+      evt.stopPropagation();
+      evt.preventDefault();
+      callback(evt);
+    });
+  }
+
+  // 5) Overwrite onresize to keep overlay in correct spot
+  const originalOnResize = a.onresize;
+  a.onresize = function (newW, newH) {
+    recalcOverlay(newW, newH);
+    if (typeof originalOnResize === 'function') {
+      originalOnResize.call(a, newW, newH);
+    }
+  };
+
+  // 6) Delayed recalc in case the window is re-laid out
+  setTimeout(() => recalcOverlay(a.width, a.height), 0);
+
+  // 7) Hide on minimize, re-show on restore or maximize
+  const originalMin = a.minimize;
+  a.minimize = function(...args) {
+    overlay.style.display = 'none';
+    return originalMin.apply(a, args);
+  };
+
+  const originalRestore = a.restore;
+  a.restore = function(...args) {
+    const val = originalRestore.apply(a, args);
+    overlay.style.display = '';
+    recalcOverlay(a.width, a.height);
+    return val;
+  };
+
+  const originalMax = a.maximize;
+  a.maximize = function(...args) {
+    const val = originalMax.apply(a, args);
+    overlay.style.display = '';
+    recalcOverlay(a.width, a.height);
+    return val;
+  };
+
+  return overlay;
+}
+
+function setLayoutViaButton(
+  a,
+  {
+    widthPercent = 5,  // The overlay is 3% of the window's width
+    heightPercent = 5, // 5% of the window's height
+    label = '⨁',
+    labelFontSizePx = 36
+  } = {}
+) {
+  return createInteractionArea(a, {
+    widthPercent,
+    heightPercent,
+    horizontalCenterPercent: 50,
+    verticalPercent: 0.25, // pinned at top
+    backgroundColor: '#DDDDDD',
+    opacity: '1',
+    label,
+    labelFontSizePx,
+    callback: () => {
+      if (
+        a.associatedInterface &&
+        typeof a.associatedInterface.toggleLayout === 'function'
+      ) {
+        a.associatedInterface.toggleLayout();
+      }
+    }
+  });
+}
+
+
+
+
+
+    function Z(a) {
+        u.splice(u.indexOf(a), 1);
+        na();
+        a.removeClass("min");
+        a.min = !1;
+        a.g.title = ""
+    }
+
+    function na() {
+        for (var a = u.length, b = {}, c = {}, f = 0, d; f < a; f++) d = u[f], d = d.left + ":" + d.top, c[d] ? c[d]++ : (b[d] = 0, c[d] = 1);
+        f = 0;
+        for (var n, p; f < a; f++) d = u[f], n = d.left + ":" + d.top, p = Math.min((J - d.left - d.right) / c[n], 250), d.resize(p + 1 | 0, d.h, !0).move(d.left + b[n] * p | 0, K - d.bottom - d.h, !0), b[n]++
+    }
+    
+    //////////////////////////////// working on nw drag to move ///////////////////////////////
+function V(a, b) {
+    function c(g) {
+        m(g, true); // Prevent default actions
+        a.focus();
+        if (b === "drag" || b === "nw") { // Treat "nw" as a draggable area
+            if (a.min) {
+                a.restore();
+                return;
+            }
+            if (!a.g.classList.contains("no-max")) {
+                const now = Date.now(),
+                    delta = now - Q;
+                Q = now;
+                if (delta < 300) { // Double-click to maximize/restore
+                    a.max ? a.restore() : a.maximize();
+                    return;
+                }
+            }
+            A.classList.add("wb-lock");
+            const initialX = g.clientX;
+            const initialY = g.clientY;
+            const { x, y } = a;
+
+            const onMouseMove = (moveEvent) => {
+                const deltaX = moveEvent.clientX - initialX;
+                const deltaY = moveEvent.clientY - initialY;
+                a.move(x + deltaX, y + deltaY);
+            };
+
+            const onMouseUp = () => {
+                window.removeEventListener("mousemove", onMouseMove);
+                window.removeEventListener("mouseup", onMouseUp);
+                A.classList.remove("wb-lock");
+            };
+
+            window.addEventListener("mousemove", onMouseMove);
+            window.addEventListener("mouseup", onMouseUp);
+        } else {
+            // For all other areas (resize or other interactions)
+            A.classList.add("wb-lock");
+            const touches = g.touches;
+            p = touches && touches[0] ? touches[0] : null;
+            if (p) {
+                g = p;
+                h(window, "touchmove", f, l);
+                h(window, "touchend", d, l);
+            } else {
+                h(window, "mousemove", f, l);
+                h(window, "mouseup", d, l);
+            }
+            v = g.pageX;
+            L = g.pageY;
+        }
+    }
+
+    function f(g) {
+        m(g);
+        if (p) g = g.touches[0];
+        const q = g.pageX;
+        g = g.pageY;
+        const deltaX = q - v;
+        const deltaY = g - L;
+
+        let changedX = false, changedY = false, changedWidth = false, changedHeight = false;
+
+        if (b === "drag" || b === "nw") { // Treat "nw" as a drag area
+            a.x += deltaX;
+            a.y += deltaY;
+            changedX = changedY = true;
+        } else {
+            if (b === "e" || b === "se" || b === "ne") {
+                a.width += deltaX;
+                changedWidth = true;
+            } else if (b === "w" || b === "sw" || b === "nw") {
+                a.x += deltaX;
+                a.width -= deltaX;
+                changedX = changedWidth = true;
+            }
+            if (b === "s" || b === "se" || b === "sw") {
+                a.height += deltaY;
+                changedHeight = true;
+            } else if (b === "n" || b === "ne" || b === "nw") {
+                a.y += deltaY;
+                a.height -= deltaY;
+                changedY = changedHeight = true;
+            }
+        }
+
+        // Enforce constraints and apply changes
+        if (changedWidth) {
+            a.width = Math.max(Math.min(a.width, a.m, J - a.x - a.right), a.s);
+        }
+        if (changedHeight) {
+            a.height = Math.max(Math.min(a.height, a.l, K - a.y - a.bottom), a.o);
+        }
+        if (changedWidth || changedHeight) a.resize();
+
+        if (changedX) {
+            a.x = Math.max(Math.min(a.x, a.j ? J - 30 : J - a.width - a.right), a.j ? 30 - a.width : a.left);
+        }
+        if (changedY) {
+            a.y = Math.max(Math.min(a.y, a.j ? K - a.h : K - a.height - a.bottom), a.top);
+        }
+        if (changedX || changedY) a.move();
+
+        if (changedWidth || changedX) v = q;
+        if (changedHeight || changedY) L = g;
+    }
+        
+        
+        //////////////////////////////// working on nw drag to move ///////////////////////////////
+
+        function d(g) {
+            m(g);
+            A.classList.remove("wb-lock");
+            p ? (k("touchmove", f), k("touchend", d)) : (k("mousemove", f), k("mouseup", d))
+        }
+        var n = a.g.getElementsByClassName("wb-" + b)[0];
+        if (n) {
+            var p, v, L,
+                Q = 0;
+            h(n, "mousedown", c, ba);
+            h(n, "touchstart", c, ba)
+        }
+    }
+
+    function ma() {
+        var a = document.documentElement;
+        J = a.clientWidth;
+        K = a.clientHeight
+    }
+    e = P.prototype;
+    e.mount = function(a) {
+        this.unmount();
+        a.i || (a.i = a.parentNode);
+        this.body.textContent = "";
+        this.body.appendChild(a);
+        return this
+    };
+    e.unmount = function(a) {
+        var b = this.body.firstChild;
+        if (b) {
+            var c = a || b.i;
+            c && c.appendChild(b);
+            b.i = a
+        }
+        return this
+    };
+    e.setTitle = function(a) {
+        var b = this.g.getElementsByClassName("wb-title")[0];
+        a = this.title = a;
+        var c = b.firstChild;
+        c ? c.nodeValue = a : b.textContent = a;
+        return this
+    };
+    e.setIcon = function(a) {
+        var b = this.g.getElementsByClassName("wb-icon")[0];
+        t(b, "background-image", "url(" + a + ")");
+        t(b, "display", "inline-block");
+        return this
+    };
+    e.setBackground = function(a) {
+        t(this.g, "background", a);
+        return this
+    };
+    e.setUrl = function(a, b) {
+        var c = this.body.firstChild;
+        c && "iframe" === c.tagName.toLowerCase() ? c.src = a : (this.body.innerHTML = '<iframe src="' + a + '"></iframe>', b && (this.body.firstChild.onload = b));
+        return this
+    };
+e.focus = function(a) {
+    if (!1 === a) return this.blur();
+    if (!this.focused) {
+        a = x.length;
+        if (1 < a)
+            for (var b = 1; b <= a; b++) {
+                var c = x[a - b];
+                if (c.focused) {
+                    c.blur();
+                    x.push(x.splice(x.indexOf(this), 1)[0]);
+                    break;
+                }
+            }
+        t(this.g, "z-index", ++B);
+        this.index = B;
+        this.addClass("focus");
+        this.focused = !0; // This should update to true
+        this.onfocus && this.onfocus();
+    }
+    return this;
+};
+
+    e.blur = function(a) {
+        if (!1 === a) return this.focus();
+        this.focused && (this.removeClass("focus"), this.focused = !1, this.onblur && this.onblur());
+        return this
+    };
+    e.hide = function(a) {
+        if (!1 === a) return this.show();
+        if (!this.hidden) return this.onhide && this.onhide(), this.hidden = !0, this.addClass("hide")
+    };
+    e.show = function(a) {
+        if (!1 === a) return this.hide();
+        if (this.hidden) return this.onshow && this.onshow(), this.hidden = !1, this.removeClass("hide")
+    };
+    e.minimize = function(a) {
+        if (!1 === a) return this.restore();
+        E && oa();
+        this.max && (this.removeClass("max"), this.max = !1);
+        this.min || (u.push(this), na(), this.g.title = this.title, this.addClass("min"), this.min = !0, this.focused && (this.blur(), Ba()), this.onminimize && this.onminimize());
+        return this
+    };
+
+    function Ba() {
+        var a = x.length;
+        if (a)
+            for (--a; 0 <= a; a--) {
+                var b = x[a];
+                if (!b.min) {
+                    b.focus();
+                    break
+                }
+            }
+    }
+    e.restore = function() {
+        E && oa();
+        this.min && (Z(this), this.resize().move(), this.onrestore && this.onrestore());
+        this.max && (this.max = !1, this.removeClass("max").resize().move(), this.onrestore && this.onrestore());
+        return this
+    };
+    e.maximize = function(a) {
+        if (!1 === a) return this.restore();
+        E && oa();
+        this.min && Z(this);
+        this.max || (this.addClass("max").resize(J - this.left - this.right, K - this.top - this.bottom, !0).move(this.left, this.top, !0), this.max = !0, this.onmaximize && this.onmaximize());
+        return this
+    };
+    e.fullscreen = function(a) {
+        this.min && (Z(this), this.resize().move());
+        if (!E || !oa()) this.body[F](), E = this, this.full = !0, this.onfullscreen && this.onfullscreen();
+        else if (!1 === a) return this.restore();
+        return this
+    };
+    
+    e.restoreToNormal = function () {
+        this.resize(this.normalWidth, this.normalHeight);
+        this.move(this.normalX, this.normalY);
+        this.splitState = null; // Clear split state
+    };
+
+
+    function oa() {
+        E.full = !1;
+        if (document.fullscreen || document.fullscreenElement || document.webkitFullscreenElement || document.mozFullScreenElement) return document[fa](), !0
+    }
+    e.close = function(a) {
+        if (this.onclose && this.onclose(a)) return !0;
+        this.min && Z(this);
+        x.splice(x.indexOf(this), 1);
+        this.unmount();
+        this.g.remove();
+        this.g.textContent = "";
+        this.g = this.body = this.g.winbox = null;
+        this.focused && Ba()
+    };
+    e.move = function(a, b, c) {
+        a || 0 === a ? c || (this.x = a ? a = U(a, J - this.left - this.right, this.width) : 0, this.y = b ? b = U(b, K - this.top - this.bottom, this.height) : 0) : (a = this.x, b = this.y);
+        t(this.g, "left", a + "px");
+        t(this.g, "top", b + "px");
+        this.onmove && this.onmove(a, b);
+        return this
+    };
+    e.resize = function(a, b, c) {
+        a || 0 === a ? c || (this.width = a ? a = U(a, this.m) : 0, this.height = b ? b = U(b, this.l) : 0, a = Math.max(a, this.s), b = Math.max(b, this.o)) : (a = this.width, b = this.height);
+        t(this.g, "width", a + "px");
+        t(this.g, "height", b + "px");
+        this.onresize && this.onresize(a, b);
+        return this
+    };
+    
+    e.applySplit = function (splitConfig) {
+    const screenWidth = window.innerWidth;
+    const screenHeight = window.innerHeight;
+
+    const newWidth = screenWidth * splitConfig.width;
+    const newHeight = screenHeight * splitConfig.height;
+    const newX = screenWidth * splitConfig.x;
+    const newY = screenHeight * splitConfig.y;
+
+    this.resize(newWidth, newHeight);
+    this.move(newX, newY);
+
+    this.splitState = splitConfig; // Update current split state
+};
+
+    e.addControl = function(a) {
+        var b = a["class"],
+            c = a.image,
+            f = a.click;
+        a = a.index;
+        var d = document.createElement("span"),
+            n = this.g.getElementsByClassName("wb-control")[0],
+            p = this;
+        b && (d.className = b);
+        c && t(d, "background-image", "url(" + c + ")");
+        f && (d.onclick = function(v) {
+            f.call(this, v, p)
+        });
+        n.insertBefore(d, n.childNodes[a || 0]);
+        return this
+    };
+    e.removeControl = function(a) {
+        (a = this.g.getElementsByClassName(a)[0]) && a.remove();
+        return this
+    };
+    e.addClass = function(a) {
+        this.g.classList.add(a);
+        return this
+    };
+    e.removeClass = function(a) {
+        this.g.classList.remove(a);
+        return this
+    };
+    e.toggleClass = function(a) {
+        return this.g.classList.contains(a) ? this.removeClass(a) : this.addClass(a)
+    };
+    window.WinBox = P;
+}).call(this);
+
+</script>
+
+<script id="winbox-logic">
+    //import WinBox from "./src/js/winbox.js";
+    //window.WinBox = WinBox;
+
+    (function(){
+        let winbox;
+        window.examples = {
+            "all-options": function(){
+                new WinBox({
+                    // configuration:
+                    index: 1,
+                    id: "my-window",
+                    root: document.body,
+                    class: ["no-full", "no-max", "my-theme"],
+
+                    // appearance:
+                    title: "All Options",
+                    background: "#fff",
+                    border: 4,
+                    header: 45,
+                    icon: false,
+
+                    // initial state:
+                    modal: false,
+                    max: false,
+                    min: false,
+                    hidden: false,
+                    
+                    // dimension:
+                    width: 250,
+                    height: 200,
+                    minheight: 55,
+                    minwidth: 100,
+                    maxheight: 300,
+                    maxwidth: 500,
+                    autosize: true,
+                    
+                    // position:
+                    x: "center",
+                    y: "center",
+                    
+                    // viewport boundaries:
+                    top: 50,
+                    right: 50,
+                    bottom: 0,
+                    left: 50,
+                    
+                    // contents (choose from):
+                    url: false,
+                    mount: false,
+                    html: "width: 250, height: 200",
+                    
+                    // callbacks:
+                    oncreate: function(options){
+                        options.icon = "demo/wikipedia.svg"
+                    },
+                    onshow: function(){
+                        console.log("Show:", this.id);
+                    },
+                    onhide: function(){
+                        console.log("Hide:", this.id);
+                    },
+                    onfocus: function(){
+                        this.setBackground("#fff");
+                    },
+                    onblur: function(){
+                        this.setBackground("#999");
+                    },
+                    onresize: function(w, h){
+                        this.body.textContent =
+                            `width: ${w}, height: ${h}`;
+                    },
+                    onmove: function(x, y){
+                        this.body.textContent =
+                            `x: ${x}, y: ${y}`;
+                    },
+                    onclose: function(force){
+                        return !confirm("Close window?");
+                    },
+                    onfullscreen: function(){
+                        console.log("Fullscreen:", this.id);
+                    },
+                    onmaximize: function(){
+                        console.log("Maximize:", this.id);
+                    },
+                    onminimize: function(){
+                        console.log("Minimize:", this.id);
+                    },
+                    onrestore: function(){
+                        console.log("Restore:", this.id);
+                    }
+                });
+            },
+            "custom-template": function(){
+                const template = document.createElement("div");
+                template.innerHTML = `
+                    <div class=wb-header>
+                        <div class=wb-control>
+                            <span class=wb-custom></span>
+                            <span class=wb-close></span>
+                        </div>
+                        <div class=wb-drag>
+                            <div class=wb-title></div>
+                        </div>
+                    </div>
+                    <div class=wb-body></div>
+                `;
+                new WinBox("Custom Template", { template, background: "#313646" });
+            },
+            "theme-modern": function(){
+                new WinBox("Theme: Modern", {
+                    class: "modern",
+                    mount: document.getElementById("content")
+                                   .cloneNode(true)
+                });
+            },
+            "controls": function(){
+                winbox = new WinBox("Controls", {
+                    mount: document.getElementById("controls"),
+                    border: 4,
+                    onclose: function(force){
+                        return !force && !confirm("Close window?");
+                    }
+                });
+            }
+        };
+        window.buttons = {
+            minimize: function(){
+                winbox.minimize(!winbox.min);
+            },
+            maximize: function(){
+                winbox.maximize(!winbox.max);
+            },
+            fullscreen: function(){
+                winbox.fullscreen(!winbox.full);
+            },
+            center: function(){
+                winbox.move("center", "center");
+            },
+            move: function(){
+                winbox.move("right", "bottom");
+            },
+            resize: function(){
+                winbox.resize("50%", "50%");
+            },
+            title: function(){
+                winbox.setTitle("Title-" + Math.random());
+            },
+            color: function(){
+                winbox.setBackground(
+                    "rgb(" + (Math.random() * 255 | 0) + "," +
+                             (Math.random() * 255 | 0) + "," +
+                             (Math.random() * 255 | 0) + ")"
+                );
+            },
+            modal: function(){
+                winbox.toggleClass("modal");
+            },
+            add: function(){
+                winbox.addClass("my-theme");
+            },
+            remove: function(){
+                winbox.removeClass("my-theme");
+            },
+            close: function(){
+                winbox.close();
+            },
+            force_close: function () {
+                winbox.close(true);
+            }
+        };
+    }());
+    </script>
+    
+<script id="EditorBehavior">
+
+(function(undefined){
+
+    'use strict';
+    
+    var EditorBehaviorHooks = EditorBehaviorHooks || (function(){
+		var hooks = {};
+		
+		return {
+		    add: function(hookName, fn){
+			    if(typeof hookName == "object"){
+			    	var i;
+			    	for(i=0; i<hookName.length; i++){
+				    	var theHook = hookName[i];
+				    	if(!hooks[theHook]){
+					    	hooks[theHook] = [];
+				    	}
+				    	hooks[theHook].push(fn);
+			    	}
+			    } else {
+				    if(!hooks[hookName]){
+				    	hooks[hookName] = [];
+			    	}
+			    	hooks[hookName].push(fn);
+			    }
+		    },
+		    get: function(hookName){
+			    if(hooks[hookName]){
+			    	return hooks[hookName];
+		    	}
+		    }
+	    };
+	    
+	})(),
+	EditorBehavior = EditorBehavior || function (userOpts) {
+
+        if (typeof String.prototype.repeat !== 'function') {
+            String.prototype.repeat = function(times) {
+                if(times < 1){
+                    return '';
+                }
+                if(times % 2){
+                    return this.repeat(times - 1) + this;
+                }
+                var half = this.repeat(times / 2);
+                return half + half;
+            };
+        }
+
+        if (typeof Array.prototype.filter !== 'function') {
+            Array.prototype.filter = function(func /*, thisp */) {
+                if (this === null) {
+                    throw new TypeError();
+                }
+
+                var t = Object(this),
+                    len = t.length >>> 0;
+                if (typeof func != "function"){
+                    throw new TypeError();
+                }
+                var res = [],
+                    thisp = arguments[1];
+                for (var i = 0; i < len; i++) {
+                    if (i in t) {
+                        var val = t[i];
+                        if (func.call(thisp, val, i, t)) {
+                            res.push(val);
+                        }
+                    }
+                }
+                return res;
+            };
+        }
+
+        var defaults = {
+            textarea: null,
+            replaceTab: true,
+            softTabs: true,
+            tabSize: 4,
+            autoOpen: true,
+            overwrite: true,
+            autoStrip: true,
+            autoIndent: true,
+            fence: false
+        },
+        tab,
+        newLine,
+        charSettings = {
+
+            keyMap: [
+                { open: "\"", close: "\"", canBreak: false },
+                { open: "'", close: "'", canBreak: false },
+                { open: "(", close: ")", canBreak: false },
+                { open: "[", close: "]", canBreak: true },
+                { open: "{", close: "}", canBreak: true }
+            ]
+
+        },
+        utils = {
+        	
+        	_callHook: function(hookName, passData){
+    			var hooks = EditorBehaviorHooks.get(hookName);
+	    		passData = typeof passData=="boolean" && passData === false ? false : true;
+	    		
+	    		if(hooks){
+			    	if(passData){
+				    	var theEditor = defaults.textarea,
+				    		textVal = theEditor.value,
+				    		caretPos = utils.cursor.get(),
+				    		i;
+				    	
+				    	for(i=0; i<hooks.length; i++){
+					    	hooks[i].call(undefined, {
+					    		editor: {
+						    		element: theEditor,
+						    		text: textVal,
+						    		levelsDeep: utils.levelsDeep()
+					    		},
+						    	caret: {
+							    	pos: caretPos
+						    	},
+						    	lines: {
+							    	current: utils.cursor.getLine(textVal, caretPos),
+							    	total: utils.editor.getLines(textVal)
+						    	}
+					    	});
+				    	}
+			    	} else {
+				    	for(i=0; i<hooks.length; i++){
+				    		hooks[i].call(undefined);
+				    	}
+			    	}
+		    	}
+	    	},
+        	
+            defineNewLine: function(){
+                var ta = document.createElement('textarea');
+                ta.value = "\n";
+                
+                if(ta.value.length==2){
+                    newLine = "\r\n";
+                } else {
+                    newLine = "\n";
+                }
+            },
+            defineTabSize: function(tabSize){
+                if(typeof defaults.textarea.style.OTabSize != "undefined"){ 
+                    defaults.textarea.style.OTabSize = tabSize; return;
+                }
+                if(typeof defaults.textarea.style.MozTabSize != "undefined"){ 
+                    defaults.textarea.style.MozTabSize = tabSize; return;
+                }
+                if(typeof defaults.textarea.style.tabSize != "undefined"){ 
+                    defaults.textarea.style.tabSize = tabSize; return;
+                }
+            },
+            cursor: {
+	            getLine: function(textVal, pos){
+		        	return ((textVal.substring(0,pos)).split("\n")).length;
+	        	},
+	            get: function() {
+
+                    if (typeof document.createElement('textarea').selectionStart==="number") {
+                        return defaults.textarea.selectionStart;
+                    } else if (document.selection) {
+                        var caretPos = 0,
+                            range = defaults.textarea.createTextRange(),
+                            rangeDupe = document.selection.createRange().duplicate(),
+                            rangeDupeBookmark = rangeDupe.getBookmark();
+                        range.moveToBookmark(rangeDupeBookmark);
+
+                        while (range.moveStart('character' , -1) !== 0) {
+                            caretPos++;
+                        }
+                        return caretPos;
+                    }
+                },
+                set: function (start, end) {
+                    if(!end){
+                        end = start;
+                    }
+                    if (defaults.textarea.setSelectionRange) {
+                        defaults.textarea.focus();
+                        defaults.textarea.setSelectionRange(start, end);
+                    } else if (defaults.textarea.createTextRange) {
+                        var range = defaults.textarea.createTextRange();
+                        range.collapse(true);
+                        range.moveEnd('character', end);
+                        range.moveStart('character', start);
+                        range.select();
+                    }
+                },
+                selection: function(){
+                    var textAreaElement = defaults.textarea,
+                        start = 0, 
+                        end = 0, 
+                        normalizedValue, 
+                        range,
+                        textInputRange, 
+                        len, 
+                        endRange;
+
+                    if (typeof textAreaElement.selectionStart == "number" && typeof textAreaElement.selectionEnd == "number") {
+                        start = textAreaElement.selectionStart;
+                        end = textAreaElement.selectionEnd;
+                    } else {
+                        range = document.selection.createRange();
+
+                        if (range && range.parentElement() == textAreaElement) {
+                            
+                            normalizedValue = utils.editor.get();
+                            len = normalizedValue.length;
+                            
+                            textInputRange = textAreaElement.createTextRange();
+                            textInputRange.moveToBookmark(range.getBookmark());
+
+                            endRange = textAreaElement.createTextRange();
+                            endRange.collapse(false);
+
+                            if (textInputRange.compareEndPoints("StartToEnd", endRange) > -1) {
+                                start = end = len;
+                            } else {
+                                start = -textInputRange.moveStart("character", -len);
+                                start += normalizedValue.slice(0, start).split(newLine).length - 1;
+
+                                if (textInputRange.compareEndPoints("EndToEnd", endRange) > -1) {
+                                    end = len;
+                                } else {
+                                    end = -textInputRange.moveEnd("character", -len);
+                                    end += normalizedValue.slice(0, end).split(newLine).length - 1;
+                                }
+                            }
+                        }
+                    }
+
+                    return start==end ? false : {
+                        start: start,
+                        end: end
+                    };
+                }
+            },
+            editor: {
+                getLines: function(textVal){
+		        	return (textVal).split("\n").length;
+	        	},
+	            get: function(){
+                    return defaults.textarea.value.replace(/\r/g,'');
+                },
+                set: function(data){
+                    defaults.textarea.value = data;
+                }
+            },
+            fenceRange: function(){
+                if(typeof defaults.fence == "string"){
+
+                    var data = utils.editor.get(),
+                        pos = utils.cursor.get(),
+                        hacked = 0,
+                        matchedFence = data.indexOf(defaults.fence),
+                        matchCase = 0;
+
+                    while(matchedFence>=0){
+                        matchCase++;
+                        if( pos < (matchedFence+hacked) ){
+                            break;
+                        }
+
+                        hacked += matchedFence+defaults.fence.length;
+                        data = data.substring(matchedFence+defaults.fence.length);
+                        matchedFence = data.indexOf(defaults.fence);
+
+                    }
+
+                    if( (hacked) < pos && ( (matchedFence+hacked) > pos ) && matchCase%2===0){
+                        return true;
+                    }
+                    return false;
+                } else {
+                    return true;
+                }
+            },
+            isEven: function(_this,i){
+                return i%2;
+            },
+            levelsDeep: function(){
+                var pos = utils.cursor.get(),
+                    val = utils.editor.get();
+
+                var left = val.substring(0, pos),
+                    levels = 0,
+                    i, j;
+
+                for(i=0; i<left.length; i++){
+                    for (j=0; j<charSettings.keyMap.length; j++) {
+                        if(charSettings.keyMap[j].canBreak){
+                            if(charSettings.keyMap[j].open == left.charAt(i)){
+                                levels++;
+                            }
+
+                            if(charSettings.keyMap[j].close == left.charAt(i)){
+                                levels--;
+                            }
+                        }
+                    }
+                }
+
+                var toDecrement = 0,
+                    quoteMap = ["'", "\""];
+                for(i=0; i<charSettings.keyMap.length; i++) {
+                    if(charSettings.keyMap[i].canBreak){
+                        for(j in quoteMap){
+                            toDecrement += left.split(quoteMap[j]).filter(utils.isEven).join('').split(charSettings.keyMap[i].open).length - 1;
+                        }
+                    }
+                }
+
+                var finalLevels = levels - toDecrement;
+                
+                return finalLevels >=0 ? finalLevels : 0;
+            },
+            deepExtend: function(destination, source) {
+                for (var property in source) {
+                    if (source[property] && source[property].constructor &&
+                        source[property].constructor === Object) {
+                        destination[property] = destination[property] || {};
+                        utils.deepExtend(destination[property], source[property]);
+                    } else {
+                        destination[property] = source[property];
+                    }
+                }
+                return destination;
+            },
+            addEvent: function addEvent(element, eventName, func) {
+                if (element.addEventListener){
+                    element.addEventListener(eventName,func,false);
+                } else if (element.attachEvent) {
+                    element.attachEvent("on"+eventName, func);
+                }
+            },
+            removeEvent: function addEvent(element, eventName, func){
+	            if (element.addEventListener){
+	                element.removeEventListener(eventName,func,false);
+	            } else if (element.attachEvent) {
+	                element.detachEvent("on"+eventName, func);
+	            }
+	        },
+	        
+            preventDefaultEvent: function(e){
+                if(e.preventDefault){
+                    e.preventDefault();
+                } else {
+                    e.returnValue = false;
+                }
+            }
+        },
+        intercept = {
+            tabKey: function (e) {
+
+                if(!utils.fenceRange()){ return; }
+
+                if (e.keyCode == 9) {
+                    utils.preventDefaultEvent(e);
+                    
+                    var toReturn = true;
+                    utils._callHook('tab:before');
+                    
+                    var selection = utils.cursor.selection(),
+                        pos = utils.cursor.get(),
+                        val = utils.editor.get();
+
+                    if(selection){
+                        
+                        var tempStart = selection.start;
+                        while(tempStart--){
+                            if(val.charAt(tempStart)=="\n"){
+                                selection.start = tempStart + 1;
+                                break;
+                            }
+                        }
+
+                        var toIndent = val.substring(selection.start, selection.end),
+                            lines = toIndent.split("\n"),
+                            i;
+
+                        if(e.shiftKey){
+                            for(i = 0; i<lines.length; i++){
+                                if(lines[i].substring(0,tab.length) == tab){
+                                    lines[i] = lines[i].substring(tab.length);
+                                }
+                            }
+                            toIndent = lines.join("\n");
+                            
+                            utils.editor.set( val.substring(0,selection.start) + toIndent + val.substring(selection.end) );
+                            utils.cursor.set(selection.start, selection.start+toIndent.length);
+
+                        } else {
+                            for(i in lines){
+                                lines[i] = tab + lines[i];
+                            }
+                            toIndent = lines.join("\n");
+
+                            utils.editor.set( val.substring(0,selection.start) + toIndent + val.substring(selection.end) );
+                            utils.cursor.set(selection.start, selection.start+toIndent.length);
+                        }
+                    } else {
+                        var left = val.substring(0, pos),
+                            right = val.substring(pos),
+                            edited = left + tab + right;
+
+                        if(e.shiftKey){
+                            if(val.substring(pos-tab.length, pos) == tab){
+                                edited = val.substring(0, pos-tab.length) + right;
+                                utils.editor.set(edited);
+                                utils.cursor.set(pos-tab.length);
+                            }
+                        } else {
+                            utils.editor.set(edited);
+                            utils.cursor.set(pos + tab.length);
+                            toReturn = false;
+                        }
+                    }
+                    utils._callHook('tab:after');
+                }
+                return toReturn;
+            },
+            enterKey: function (e) {
+
+                if(!utils.fenceRange()){ return; }
+
+                if (e.keyCode == 13) {
+
+                    utils.preventDefaultEvent(e);
+                    utils._callHook('enter:before');
+                    
+                    var pos = utils.cursor.get(),
+                        val = utils.editor.get(),
+                        left = val.substring(0, pos),
+                        right = val.substring(pos),
+                        leftChar = left.charAt(left.length - 1),
+                        rightChar = right.charAt(0),
+                        numTabs = utils.levelsDeep(),
+                        ourIndent = "",
+                        closingBreak = "",
+                        finalCursorPos,
+                        i;
+                    if(!numTabs){
+                        finalCursorPos = 1;
+                    } else {
+                        while(numTabs--){
+                            ourIndent+=tab;
+                        }
+                        ourIndent = ourIndent;
+                        finalCursorPos = ourIndent.length + 1;
+
+                        for(i=0; i<charSettings.keyMap.length; i++) {
+                            if (charSettings.keyMap[i].open == leftChar && charSettings.keyMap[i].close == rightChar){
+                                closingBreak = newLine;
+                            }
+                        }
+                        
+                    }
+
+                    var edited = left + newLine + ourIndent + closingBreak + (ourIndent.substring(0, ourIndent.length-tab.length) ) + right;
+                    utils.editor.set(edited);
+                    utils.cursor.set(pos + finalCursorPos);
+                    utils._callHook('enter:after');
+                }
+            },
+            deleteKey: function (e) {
+
+	            if(!utils.fenceRange()){ return; }
+	
+	            if(e.keyCode == 8){
+	            	utils.preventDefaultEvent(e);
+	                            
+	            	utils._callHook('delete:before');
+	            	
+	            	var pos = utils.cursor.get(),
+	                    val = utils.editor.get(),
+	                    left = val.substring(0, pos),
+	                    right = val.substring(pos),
+	                    leftChar = left.charAt(left.length - 1),
+	                    rightChar = right.charAt(0),
+	                    i;
+	            	
+	                if( utils.cursor.selection() === false ){
+	                    for(i=0; i<charSettings.keyMap.length; i++) {
+	                        if (charSettings.keyMap[i].open == leftChar && charSettings.keyMap[i].close == rightChar) {
+	                            var edited = val.substring(0,pos-1) + val.substring(pos+1);
+	                            utils.editor.set(edited);
+	                            utils.cursor.set(pos - 1);
+	                            return;
+	                        }
+	                    }
+	                    var edited = val.substring(0,pos-1) + val.substring(pos);
+	                    utils.editor.set(edited);
+	                    utils.cursor.set(pos - 1);
+	                } else {
+	                	var sel = utils.cursor.selection(),
+	                		edited = val.substring(0,sel.start) + val.substring(sel.end);
+	                    utils.editor.set(edited);
+	                    utils.cursor.set(pos);
+	                }
+	                
+	                utils._callHook('delete:after');
+	                
+	            }
+	        }
+        },
+        charFuncs = {
+            openedChar: function (_char, e) {
+                utils.preventDefaultEvent(e);
+                utils._callHook('openChar:before');
+                var pos = utils.cursor.get(),
+                    val = utils.editor.get(),
+                    left = val.substring(0, pos),
+                    right = val.substring(pos),
+                    edited = left + _char.open + _char.close + right;
+
+                defaults.textarea.value = edited;
+                utils.cursor.set(pos + 1);
+                utils._callHook('openChar:after');
+            },
+            closedChar: function (_char, e) {
+                var pos = utils.cursor.get(),
+                    val = utils.editor.get(),
+                    toOverwrite = val.substring(pos, pos + 1);
+                if (toOverwrite == _char.close) {
+                    utils.preventDefaultEvent(e);
+                    utils._callHook('closeChar:before');
+                    utils.cursor.set(utils.cursor.get() + 1);
+                    utils._callHook('closeChar:after');
+                    return true;
+                }
+                return false;
+            }
+        },
+        action = {
+            filter: function (e) {
+
+                if(!utils.fenceRange()){ return; }
+
+                var theCode = e.which || e.keyCode;
+                
+                if(theCode == 39 || theCode == 40 && e.which===0){ return; }
+
+                var _char = String.fromCharCode(theCode),
+                    i;
+
+                for(i=0; i<charSettings.keyMap.length; i++) {
+
+                    if (charSettings.keyMap[i].close == _char) {
+                        var didClose = defaults.overwrite && charFuncs.closedChar(charSettings.keyMap[i], e);
+
+                        if (!didClose && charSettings.keyMap[i].open == _char && defaults.autoOpen) {
+                            charFuncs.openedChar(charSettings.keyMap[i], e);
+                        }
+                    } else if (charSettings.keyMap[i].open == _char && defaults.autoOpen) {
+                        charFuncs.openedChar(charSettings.keyMap[i], e);
+                    }
+                }
+            },
+            listen: function () {
+
+                if(defaults.replaceTab){ utils.addEvent(defaults.textarea, 'keydown', intercept.tabKey); }
+                if(defaults.autoIndent){ utils.addEvent(defaults.textarea, 'keydown', intercept.enterKey); }
+                if(defaults.autoStrip){ utils.addEvent(defaults.textarea, 'keydown', intercept.deleteKey); }
+
+                utils.addEvent(defaults.textarea, 'keypress', action.filter);
+                
+                utils.addEvent(defaults.textarea, 'keydown', function(){ utils._callHook('keydown'); });
+                utils.addEvent(defaults.textarea, 'keyup', function(){ utils._callHook('keyup'); });
+            }
+        },
+        init = function (opts) {
+
+            if(opts.textarea){
+            	utils._callHook('init:before', false);
+                utils.deepExtend(defaults, opts);
+                utils.defineNewLine();
+
+                if (defaults.softTabs) {
+                    tab = " ".repeat(defaults.tabSize);
+                } else {
+                    tab = "\t";
+
+                    utils.defineTabSize(defaults.tabSize);
+                }
+
+                action.listen();
+                utils._callHook('init:after', false);
+            }
+
+        };
+
+        this.destroy = function(){
+            utils.removeEvent(defaults.textarea, 'keydown', intercept.tabKey);
+	        utils.removeEvent(defaults.textarea, 'keydown', intercept.enterKey);
+	        utils.removeEvent(defaults.textarea, 'keydown', intercept.deleteKey);
+	        utils.removeEvent(defaults.textarea, 'keypress', action.filter);
+        };
+
+        init(userOpts);
+
+    };
+
+    if (typeof module !== 'undefined' && module.exports) {
+        module.exports = EditorBehavior;
+    }
+
+    if (typeof ender === 'undefined') {
+        this.EditorBehavior = EditorBehavior;
+        this.EditorBehaviorHooks = EditorBehaviorHooks;
+    }
+
+    if (typeof define === "function" && define.amd) {
+        define("behave", [], function () { 
+            return EditorBehavior; 
+        });
+    }
+
+}).call(this);
+</script>
+
+    <style>
+        body {
+            margin: 0;
+            font-family: monospace;
+            background: white;
+        }
+        .icon {
+          font-family: monospace;
+        font-size: 64px;
+        width: 60px; /* Set width to make it square */
+        height: 60px; /* Set height to match width */
+        background-color: #555; /* Button background color */
+        color: #fff; /* Text color */
+        border: none; /* Remove default border */
+        border-radius: 10px; /* Rounded corners */
+        display: flex; /* Flexbox for centering */
+        justify-content: center; /* Center text horizontally */
+        align-items: center; /* Center text vertically */
+        cursor: pointer; /* Pointer cursor on hover */
+        }
+        .root-space {
+            padding: 10px;
+        }
+        .root-space::-webkit-scrollbar {
+            width: var(--scrollbar-width);
+            height: var(--scrollbar-width);
+        }
+
+        .root-space::-webkit-scrollbar-thumb {
+            background-color: rgba(0, 0, 0, 0.1);
+            border-radius: var(--border-radius);
+        }
+
+        .root-space::-webkit-scrollbar-thumb:hover {
+            background-color: rgba(0, 0, 0, 0.4);
+            transition: background-color 1s ease;
+        }
+
+        .root-space::-webkit-scrollbar-track {
+            background-color: transparent;
+        }
+        button {
+            margin: 5px;
+            padding: 10px;
+        }
+</style>
+<body>
+
+<template id="interpreter">
+    <div class="interpreter">
+        <style>
+            :root {
+                --fontsize: 18px; /* Base font size */
+                --zoom: 1; /* Global zoom level */
+            }
+
+            .interpreter {
+                --scaled-fontsize: calc(var(--fontsize) * var(--zoom));
+                --lineheight: calc(var(--scaled-fontsize) * 1.2);
+                --padding: calc(var(--scaled-fontsize) * var(--zoom) * 0.0);
+                --border-width: calc(var(--scaled-fontsize) * var(--zoom) * 0.1);
+                --margin-between-buffers: calc(var(--lineheight) * var(--zoom) * 0.0);
+                --scrollbar-width: calc(var(--scaled-fontsize) * var(--zoom) * 0.25);
+                --border-radius: calc(var(--scaled-fontsize) * var(--zoom) * 0);
+
+                
+                font-size: var(--scaled-fontsize);
+                background: #ff8888;
+                height: 100%; /* Ensure full height */
+                font-smooth: always;
+            }
+
+            .window-container {
+                display: flex;
+                width: 100%;
+                height: 100%;
+                border: 2px solid #000;
+                box-sizing: border-box;
+                overflow: hidden;
+            }
+            
+            .window-container.maximized {
+                border: none; /* Removes the border when maximized */
+            }
+
+            .textarea-pane-container {
+                flex: 1; /* Text pane shares space equally in split view */
+                display: flex;
+                flex-direction: column;
+                background: #0000ff;
+                box-sizing: border-box;
+                border: 0;
+            }
+
+            .textarea-pane {
+                flex: 1; /* Full height of the container */
+                resize: none;
+                padding: 0.25em;
+                box-sizing: border-box;
+                font-family: monospace;
+                font-size: var(--scaled-fontsize);
+                overflow-y: auto; /* Ensure scrollbars behave like outputBuffer */
+                overflow-x: auto;
+                border: calc(var(--border-width)) solid #ddd;
+                font-family: Iosevka, monospace;
+            }
+
+            .interpreter-container {
+                flex: 1; /* Interpreter shares space equally in split view */
+                display: flex;
+                flex-direction: column;
+                box-sizing: border-box;
+                border: 0;
+            }
+
+            .interpreter #outputBuffer {
+                flex: 1;
+                line-height: var(--lineheight);
+                overflow-y: auto;
+                overflow-x: auto;
+                background-color: #f8f8ff;
+                color: #000;
+                font-size: var(--scaled-fontsize);
+                border: var(--border-width) solid #ddd;
+                border-radius: var(--border-radius);
+                padding: 0.25em;
+                white-space: pre-wrap;
+                word-wrap: break-word;
+                margin: 0; /* Eliminate vertical gaps */
+                font-family: Iosevka, monospace;
+            }
+
+            .interpreter #inputBuffer {
+                flex: 0 0 auto;
+                width: 100%;
+                line-height: calc(var(--lineheight) * 1);
+                font-size: var(--scaled-fontsize);
+                overflow-y: auto;
+                box-sizing: border-box;
+                border: var(--border-width) solid #ddd;
+                border-radius: var(--border-radius);
+                resize: none;
+                padding: 0.25em;
+                padding-right:0;
+                font-family: Iosevka, monospace;
+            }
+                        
+            textarea:focus {
+                outline: 3px dotted #9B6DFFBB; /* Adds a black border when focused */
+                outline-offset: -3px; /* Adjusts the space between the outline and the element */
+            }
+            
+            .small-split { /* applies a styling to the body of a window with a smallish width split level */
+                font-size: calc(var(--scaled-fontsize)* 0.9) !important;
+                line-height: calc(var(--lineheight) * 0.9) !important;
+                padding: calc(0.25em * 0.5) !important;
+            }
+            
+            #inputBuffer.input-buffer-size-on-split { /* modifies input dimensions in small-split case - not working */
+                height: calc(var(--lineheight) * 0.1) !important;
+            }
+
+            /* Scrollbar Styling */
+            .textarea-pane::-webkit-scrollbar,
+            .interpreter #outputBuffer::-webkit-scrollbar,
+            .interpreter #inputBuffer::-webkit-scrollbar {
+                width: var(--scrollbar-width);
+                height: var(--scrollbar-width);
+            z-index:
+            }
+
+            .textarea-pane::-webkit-scrollbar-thumb,
+            .interpreter #outputBuffer::-webkit-scrollbar-thumb,
+            .interpreter #inputBuffer::-webkit-scrollbar-thumb {
+                background-color: rgba(0, 0, 0, 0.1);
+                border-radius: var(--border-radius);
+            }
+
+            .textarea-pane::-webkit-scrollbar-thumb:hover,
+            .interpreter #outputBuffer::-webkit-scrollbar-thumb:hover,
+            .interpreter #inputBuffer::-webkit-scrollbar-thumb:hover {
+                background-color: rgba(0, 0, 0, 0.4);
+                transition: background-color 1s ease;
+            }
+
+            .textarea-pane::-webkit-scrollbar-track,
+            .interpreter #outputBuffer::-webkit-scrollbar-track,
+            .interpreter #inputBuffer::-webkit-scrollbar-track {
+                background-color: transparent;
+            }
+            
+            /* prevent border doubling */
+            
+            /* Prevent double borders between inputBuffer and outputBuffer */
+            .interpreter #outputBuffer:not(:last-child) {
+                border-bottom: none; /* Remove bottom border of outputBuffer */
+            }
+            
+            
+            
+            /* todo styling */
+
+            .TODO {
+                font-size: 24px;
+                overflow: hidden;
+            }
+            .TODO > * {
+            padding-left: 1em;
+            }
+            
+            ul {
+              list-style-type: none;
+            }
+           
+            li:before {
+              content: "+";
+              padding-right: 5px;
+            }
+            
+            /* Scrollbar Styling */
+            .textarea-pane::-webkit-scrollbar,
+            .interpreter #outputBuffer::-webkit-scrollbar,
+            .interpreter #inputBuffer::-webkit-scrollbar {
+                width: var(--scrollbar-width);
+                height: var(--scrollbar-width);
+            z-index:
+            }
+
+            .textarea-pane::-webkit-scrollbar-thumb,
+            .interpreter #outputBuffer::-webkit-scrollbar-thumb,
+            .interpreter #inputBuffer::-webkit-scrollbar-thumb {
+                background-color: rgba(0, 0, 0, 0.1);
+                border-radius: var(--border-radius);
+            }
+
+            .textarea-pane::-webkit-scrollbar-thumb:hover,
+            .interpreter #outputBuffer::-webkit-scrollbar-thumb:hover,
+            .interpreter #inputBuffer::-webkit-scrollbar-thumb:hover {
+                background-color: rgba(0, 0, 0, 0.4);
+                transition: background-color 1s ease;
+            }
+
+            .textarea-pane::-webkit-scrollbar-track,
+            .interpreter #outputBuffer::-webkit-scrollbar-track,
+            .interpreter #inputBuffer::-webkit-scrollbar-track {
+                background-color: transparent;
+            }
+                        
+      </style>
+
+        <div class="window-container">
+            <!-- Text Pane Container -->
+            <div id="textContainer" class="textarea-pane-container">
+                <textarea id="textPane" class="textarea-pane" spellcheck="false"></textarea>
+            </div>
+
+            <!-- Interpreter Container -->
+            <div class="interpreter-container">
+                <pre id="outputBuffer" class="output-buffer"></pre>
+                <textarea id="inputBuffer" class="input-buffer" rows="1" cols="40" spellcheck="false"></textarea>
+            </div>
+        </div>
+    </div>
+</template>
+<script>
+disableAnimations();
+//enableAnimations();
+        // Interpreter Logic
+        class Interpreter {
+            constructor() {
+            }
+            
+            shellOutputCollector(text) {
+              // This is a new method. We'll do something like:
+              this.appendOutput(text, "black"); 
+            }
+            navigateHistory(direction) {
+        if (direction === "up" && this.historyIndex > 0) {
+            this.historyIndex--;
+        } else if (direction === "down" && this.historyIndex < this.commandHistory.length - 1) {
+            this.historyIndex++;
+        } else if (direction === "down") {
+            this.historyIndex = this.commandHistory.length;
+            return "";
+        }
+        return this.commandHistory[this.historyIndex] || "";
+    }
+}
+</script>
+
+<script>
+
+let useLocalStorage = false;  // default to false as requested
+</script>
+
+<script id="shell-logic">
+
+const COMMAND_ALIASES = {
+  "what": ["ls"],  
+  "where": ["pwd"],
+  "type": ["echo"],
+  "trash": ["rm"],
+  "view": ["cat"],
+  "new": ["touch"],
+  "new place": ["mkdir"],
+  "go to": ["cd", "goto", "go"],
+  "help": ["help"],
+  "export": ["export"],
+  "import": ["import"],
+  "tree": ["tree", "map"],
+  "clear": ["clear"],
+  "forth": ["forth"]
+};
+
+function findPrimaryName(command) {
+  for (let primary in COMMAND_ALIASES) {
+    if (primary === command || COMMAND_ALIASES[primary].includes(command)) {
+      return primary;
+    }
+  }
+  return command;
+}
+
+// 2) THE SHELL CLASS
+class Shell {
+    constructor(printCallback, appendHistoryCallback) {
+        this.printCallback = printCallback;
+        this.appendHistoryCallback = appendHistoryCallback;        
+        if (useLocalStorage) {
+            this.filesystem = this.loadFileSystem() || { '/': {} };
+        } else {
+            this.filesystem = { '/': {} };
+        }
+        this.currentPath = '/';
+    }
+
+    // Local Storage Logic
+    loadFileSystem() {
+        if (!useLocalStorage) return null;  
+        return JSON.parse(localStorage.getItem('bridge-filesystem'));
+    }
+    saveFileSystem() {
+        if (!useLocalStorage) return;  
+        localStorage.setItem('bridge-filesystem', JSON.stringify(this.filesystem));
+    }
+
+    // Print
+    print(text) {
+        if (this.printCallback) {
+            this.printCallback(text + "\n");  
+        }
+    }
+
+    // Parse input
+    parseInput(input) {
+        const args = [];
+        let current = '';
+        let inQuotes = false;
+        for (let i = 0; i < input.length; i++) {
+            const char = input[i];
+            if (char === '"' || char === "'") {
+                inQuotes = !inQuotes;
+            } else if (char === ' ' && !inQuotes) {
+                if (current !== '') {
+                    args.push(current);
+                    current = '';
+                }
+            } else {
+                current += char;
+            }
+        }
+        if (current !== '') {
+            args.push(current);
+        }
+        return args;
+    }
+
+    getPrompt() {
+        return `${this.currentPath} >`;
+    }
+
+    // 3) MAIN COMMAND PROCESSOR
+    processCommand(inputLine) {
+        // parse arguments
+        const args = this.parseInput(inputLine.trim());
+        // must be 'let' so we can reassign
+        let command = args[0];
+        const rest = args.slice(1);
+
+        // unify command with alias
+        command = findPrimaryName(command);
+
+        switch (command) {
+          // Export logic
+          case 'export':
+            if (rest.includes('-h') || (rest[0] === 'with' && rest[1] === 'history')) {
+              this.exportFileSystem(true);
+            } else {
+              this.exportFileSystem(false);
+            }
+            return null;
+
+          // Import logic
+          case 'import':
+            this.importFileSystem(rest.join(' '));
+            return null;
+
+          // Renamed commands
+          case 'what':
+            this.cmdWhat();
+            break;
+          case 'where':
+            this.cmdWhere();
+            break;
+          case 'type':
+            this.cmdType(rest);
+            break;
+          case 'trash':
+            this.cmdTrash(rest[0]);
+            break;
+          case 'view':
+            this.cmdView(rest[0]);
+            break;
+          case 'new':
+            if (rest[0] === 'place') {
+              this.cmdNewPlace(rest[1]);
+            } else {
+              this.cmdNew(rest[0]);
+            }
+            break;
+          case 'go to':
+            this.cmdGoTo(rest[0]);
+            break;
+
+          // Unchanged commands
+          case 'help':
+            this.help();
+            break;
+          case 'tree':
+            this.tree();
+            break;
+          case 'clear':
+            return { command: 'clear' };
+          case 'forth':
+            return { command: 'forth' };
+
+          // Default / unknown
+          default:
+            if (command) {
+              this.print(`Command not found: ${args[0]}`);
+            }
+        }
+        return null;
+    }
+
+    // 4) IMPLEMENTATION OF COMMANDS
+    cmdWhat() {
+        const dir = this.getDirectory(this.currentPath);
+        if (!dir) {
+            this.print(`No such place: ${this.currentPath}`);
+            return;
+        }
+        const entries = Object.keys(dir);
+        if (entries.length === 0) {
+            this.print("Nothing here.");
+            return;
+        }
+        let output = "";
+        for (let name of entries) {
+            if (typeof dir[name] === 'object') {
+                output += `\x1b[35mplace:\x1b[0m  ${name}\n`; 
+            } else {
+                output += `thing:  ${name}\n`;
+            }
+        }
+        this.print(output.trimEnd());
+    }
+
+    cmdGoTo(path) {
+        if (!path || path === '~') {
+            this.currentPath = '/';
+            return;
+        }
+        const newPath = this.resolvePath(path);
+        if (this.getDirectory(newPath) !== null) {
+            this.currentPath = newPath;
+        } else {
+            this.print(`No such place: ${path}`);
+        }
+    }
+
+    cmdNewPlace(name) {
+        if (!name) {
+            this.print('new place: missing name');
+            return;
+        }
+        const dir = this.getDirectory(this.currentPath);
+        if (!dir[name]) {
+            dir[name] = {};
+            this.saveFileSystem();
+        } else {
+            this.print(`new place: cannot create place '${name}': thing exists`);
+        }
+    }
+
+    cmdNew(name) {
+        if (!name) {
+            this.print('new: missing thing name or place operand');
+            return;
+        }
+        const dir = this.getDirectory(this.currentPath);
+        if (!dir[name]) {
+            dir[name] = '';
+            this.saveFileSystem();
+        } else if (typeof dir[name] === 'object') {
+            this.print(`new: cannot create thing '${name}': Is a place`);
+        }
+    }
+    
+    // INSERT around your shell command methods
+treeDirectory(dirObj, prefix = '', parentIsLast = false) {
+    // 'dirObj' is the current directory object
+    // 'prefix' is the text offset (e.g. '│   ' or '    ')
+    // 'parentIsLast' indicates if this is the last item in a set
+
+    // We'll track total dirs/files in local counters 
+    // and return them so the caller can print the summary
+    let totalDirs = 0;
+    let totalFiles = 0;
+    let output = '';
+
+    const entries = Object.keys(dirObj);
+    entries.forEach((name, index) => {
+        const isLast = index === entries.length - 1;
+        // Build the connector
+        const connector = isLast ? '└── ' : '├── ';
+        // Depending on whether parent is last, choose the next prefix
+        const nextPrefix = prefix + (parentIsLast ? '    ' : '│   ');
+
+        if (typeof dirObj[name] === 'object') {
+            // It's a directory
+            output += prefix + connector + name + '\n';
+            totalDirs++;
+            // Recurse
+            const subResult = this.treeDirectory(dirObj[name], nextPrefix, isLast);
+            output += subResult.output;
+            totalDirs += subResult.totalDirs;
+            totalFiles += subResult.totalFiles;
+        } else {
+            // It's a file
+            output += prefix + connector + name + '\n';
+            totalFiles++;
+        }
+    });
+
+    return { output, totalDirs, totalFiles };
+}
+
+// Search for "cmdView(name)" and REPLACE the entire function with this:
+cmdView(name) {
+    // 1) If user typed `view here`, treat it like `view .`
+    if (name === 'here') {
+        name = '.';
+    }
+
+    // 2) If user gave no argument at all, let them know
+    if (!name) {
+        name = '.';
+    }
+
+    // 3) Build a resolved path to the target
+    const targetPath = this.resolvePath(name);
+    const dirOrFile = this.getDirectory(targetPath);  // if object => directory; if null => doesn't exist
+
+    // If it's an object => directory => run tree
+    if (dirOrFile && typeof dirOrFile === 'object') {
+        // Show a tree of that directory
+        const { output, totalDirs, totalFiles } = this.treeDirectory(dirOrFile, '', false);
+        let summary = `\n${totalDirs} places, ${totalFiles} things`;
+        this.print(output + summary);
+        return;
+    }
+
+    // If it's a string => file => cat contents
+    const parentDir = this.getDirectory(this.currentPath);
+    // Parent dir might be null if we've cd'd into something invalid, so check carefully
+    if (!parentDir) {
+        this.print(`view: cannot read outer path`);
+        return;
+    }
+
+    const fileContent = parentDir[name];
+    if (typeof fileContent === 'string') {
+        this.print(fileContent);
+    } else if (fileContent === undefined) {
+        this.print(`view: ${name}: No such thing or place`);
+    } else {
+        this.print(`view: ${name}: Is a place`);
+    }
+}
+
+    cmdType(args) {
+        let redirect = false;
+        let append = false;
+        let fileName = '';
+        let output = [];
+        for (let i = 0; i < args.length; i++) {
+            if (args[i] === '>' || args[i] === '>>') {
+                redirect = true;
+                append = args[i] === '>>';
+                fileName = args[i + 1];
+                break;
+            } else {
+                output.push(args[i]);
+            }
+        }
+        const message = output.join(' ');
+
+        if (redirect) {
+            const dir = this.getDirectory(this.currentPath);
+            if (dir[fileName] === undefined || typeof dir[fileName] === 'string') {
+                dir[fileName] = append ? (dir[fileName] || '') + message : message;
+                this.saveFileSystem();
+            } else {
+                this.print(`type: cannot write to place '${fileName}'`);
+            }
+        } else {
+            this.print(message);
+        }
+    }
+
+    cmdTrash(name) {
+        if (!name) {
+            this.print('trash: missing name');
+            return;
+        }
+        const dir = this.getDirectory(this.currentPath);
+        if (dir[name]) {
+            delete dir[name];
+            this.saveFileSystem();
+        } else {
+            this.print(`trash: cannot remove '${name}': No such thing or place`);
+        }
+    }
+
+    cmdWhere() {
+        this.print(this.currentPath === '' ? '/' : this.currentPath);
+    }
+
+    help() {
+      const helpText = `Available commands:
+what              - List contents of place
+where             - Show current place
+type              - Display message
+                    or write to thing with ' >> '
+view 'here|'name' - Display place or thing
+new 'name'        - Create a new thing
+new place 'name'  - Create a new place
+trash 'name'      - Remove places or things
+go to 'name'      - go to another place (relative)
+clear             - Clear display
+map               - Display structure
+help              - Show this help message
+export [-h]       - Export the filesystem (todo/test) 
+import <json>     - Import JSON (todo)
+forth             - Boot into the forth VM`;
+      this.print(helpText);
+    }
+
+    // 5) Export / Import
+    exportFileSystem(includeHistory = false) {
+        const exportObject = { filesystem: this.filesystem };
+        // If user requested history, include it
+        if (includeHistory && Array.isArray(globalCommandHistory)) {
+            exportObject._history = [...globalCommandHistory];
+        }
+
+        // Create timestamp
+        const now = new Date();
+        const YY = now.getFullYear().toString().slice(-2);
+        const MM = String(now.getMonth() + 1).padStart(2, '0');
+        const DD = String(now.getDate()).padStart(2, '0');
+        const hh = String(now.getHours()).padStart(2, '0');
+        const mm = String(now.getMinutes()).padStart(2, '0');
+
+        const filename = `${YY}${MM}${DD}${hh}${mm}_bridge_filesys.json`;
+
+        const blob = new Blob([ JSON.stringify(exportObject, null, 2) ], { type: 'application/json' });
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = filename;
+        link.click();
+
+        this.print(`Filesystem exported as ${filename}`);
+    }
+
+    importFileSystem(jsonString) {
+        if (!jsonString) {
+            this.print("Usage: export [-h] or 'with history'");
+            return;
+        }
+        try {
+            const fsObj = JSON.parse(jsonString);
+            if (typeof fsObj === 'object') {
+                // Overwrite filesystem
+                if (fsObj.filesystem) {
+                    this.filesystem = fsObj.filesystem;
+                }
+                // If command history is present, append
+                if (Array.isArray(fsObj._history) && this.appendHistoryCallback) {
+                    this.appendHistoryCallback(fsObj._history);
+                }
+                this.saveFileSystem();
+                this.print("Image imported successfully.");
+            } else {
+                this.print("Invalid image for filesystem import.");
+            }
+        } catch (e) {
+            this.print("Error parsing image for import.");
+        }
+    }
+
+    // 6) Internals
+    getDirectory(path) {
+        const parts = path.split('/').filter(Boolean);
+        let dir = this.filesystem['/']; 
+        for (const part of parts) {
+            if (dir[part] && typeof dir[part] === 'object') {
+                dir = dir[part];
+            } else {
+                return null;
+            }
+        }
+        return dir;
+    }
+
+    resolvePath(path) {
+        if (path.startsWith('/')) {
+            return path;
+        }
+        const currentParts = this.currentPath.split('/').filter(Boolean);
+        const newParts = path.split('/').filter(Boolean);
+        const fullPath = [...currentParts, ...newParts];
+        const resolvedParts = [];
+
+        for (const part of fullPath) {
+            if (part === '..') {
+                resolvedParts.pop();
+            } else if (part !== '.') {
+                resolvedParts.push(part);
+            }
+        }
+        return '/' + resolvedParts.join('/');
+    }
+}
+</script>
+
+<script>
+
+// Interface Logic
+class InterpreterInterface {
+    static instances = [];
+    static activeInstanceIndex = 0;
+    static minimizedStack = [];
+
+    constructor(container, interpreter, instanceNumber) {
+        this.container = container;
+        this.interpreter = interpreter;
+        
+// Create the shell here:
+this.shell = new Shell(
+  (text) => {
+    // First callback: printing to output
+    this.appendOutput(text, "black");
+  },
+  (importedLines) => {
+    // Second callback: appending to command history
+    this.commandHistory.push(...importedLines);
+  }
+);
+
+        this.currentVM = null;     // Track the active VM
+        this.vmOutputCollector = [];
+        this.commandHistory = [];
+        this.historyIndex = -1;
+        this.currentPrompt = '';
+
+        this.textContainer = container.querySelector('#textContainer');
+        this.textPane = container.querySelector('#textPane');
+        this.interpreterContainer = container.querySelector('.interpreter-container');
+        this.inputBuffer = container.querySelector('#inputBuffer');
+        this.outputBuffer = container.querySelector('#outputBuffer');
+
+        this.defaultLineHeight = parseFloat(getComputedStyle(this.inputBuffer).lineHeight);
+        this.maxRows = 5;
+        this.initialHeight = this.inputBuffer.offsetHeight;
+        this.layoutState = 2; // Default: Split view -- default layout
+
+        this.instanceNumber = instanceNumber;
+        this.constructor.instances.push(this);
+
+        this.lastFocusedElement = null;
+        
+        // New boolean to control whether textPane commands are recorded in history
+        this.recordTextPaneCommands = false; // Set to true if you want textPane commands recorded
+
+        this.initialize();
+    }
+
+    initialize() {
+        this.inputBuffer.style.minHeight = `${this.initialHeight}px`;
+        
+        this.renderPrompt();
+
+        // Active instance
+        this.container.addEventListener('click', () => {
+            this.constructor.setActiveInstance(this);
+        });
+        
+        this.inputBuffer.value = this.shell.getPrompt() + ' ';
+
+        // Global shortcuts
+        document.addEventListener('keydown', (event) => {
+            const activeInstance = this.constructor.instances[this.constructor.activeInstanceIndex];
+            if (activeInstance === this) {
+                if (event.altKey && event.key === '2') {
+                    //console.log("Alt+2 detected: Layout switching");
+                    event.preventDefault();
+                    this.toggleLayout();
+                }
+                if (event.altKey && event.key === '1') {
+                    //console.log('Alt+3 detected: Input area switching in split layout');
+                    event.preventDefault();
+                    this.cycleFocusBetweenInputs();
+                }
+                if (event.altKey && event.key === 'Enter') {
+                    //console.log('Alt+Enter detected: Send text pane input');
+                    event.preventDefault();
+                    this.sendTextPaneInput();
+                }
+            }
+
+            // Save/Load shortcuts only if textPane is focused
+            if (document.activeElement === this.textPane) {
+                if (event.altKey && event.key === 's') {
+                    console.log('Alt+S detected: Save text pane content');
+                    event.preventDefault();
+                    this.saveToFile();
+                }
+                if (event.altKey && event.key === 'o') {
+                    console.log('Alt+O detected: Load text pane content');
+                    event.preventDefault();
+                    this.loadFromFile();
+                }
+            }
+        });
+
+        // Focus tracking
+        this.inputBuffer.addEventListener('focus', () => {
+            this.lastFocusedElement = this.inputBuffer;
+        });
+        this.textPane.addEventListener('focus', () => {
+            this.lastFocusedElement = this.textPane;
+        });
+
+        // Input buffer handlers
+        this.inputBuffer.addEventListener('keydown', (event) => this.handleKeydown(event));
+        this.inputBuffer.addEventListener('input', () => this.adjustTextareaHeight());
+
+        this.setLayout(this.layoutState);
+
+        new EditorBehavior({
+            textarea: this.textPane,
+            replaceTab: true,
+            softTabs: true,
+            tabSize: 2,
+            autoOpen: true,
+            overwrite: true,
+            autoStrip: true,
+            autoIndent: false,
+            fence: false
+        });
+
+        new EditorBehavior({
+            textarea: this.inputBuffer,
+            replaceTab: true,
+            softTabs: true,
+            tabSize: 2,
+            autoOpen: true,
+            overwrite: true,
+            autoStrip: true,
+            autoIndent: false,
+            fence: false
+        });
+    }
+
+    toggleLayout() {
+        this.layoutState = (this.layoutState + 1) % 3; // leaving out vertical view until its working
+        console.log(`Switched to layout ${this.layoutState} for instance #${this.instanceNumber}`);
+
+        InterpreterInterface.setActiveInstance(this);
+        this.setLayout(this.layoutState);
+    }
+
+    setLayout(state) {
+    if (state === 0) {
+        // Interpreter only
+        this.textContainer.style.display = 'none';
+        this.interpreterContainer.style.display = 'flex';
+        this.interpreterContainer.style.width = '100%';
+        this.interpreterContainer.style.height = '100%'; // Full height
+        this.textContainer.classList.remove('split-view');
+        this.textPane.style.borderRight = '';
+        this.inputBuffer.focus();
+    } else if (state === 1) {
+        // Split view
+        this.textContainer.style.display = 'flex';
+        this.textContainer.style.width = '50%';
+        this.textContainer.style.height = '100%'; // Reset height
+        this.interpreterContainer.style.display = 'flex';
+        this.interpreterContainer.style.width = '50%';
+        this.interpreterContainer.style.height = '100%'; // Reset height
+        this.textContainer.classList.add('split-view');
+        this.textPane.style.borderRight = '0';
+        (this.lastFocusedElement || this.textPane).focus();
+    } else if (state === 2) {
+        // Text pane only
+        this.textContainer.style.display = 'flex';
+        this.textContainer.style.width = '100%';
+        this.textContainer.style.height = '100%'; // Full height
+        this.interpreterContainer.style.display = 'none';
+        this.textContainer.classList.remove('split-view');
+        this.textPane.style.borderRight = '';
+        this.textPane.focus();
+    } else if (state === 3) {
+        // Text pane at the top, interpreter container at the bottom -- TODO - doesn't work
+        this.container.style.display = 'flex';
+        this.container.style.flexDirection = 'column';
+        this.container.style.width = '100%';
+        this.container.style.height = '50%';
+
+        // Text pane: Top half
+        this.textContainer.style.display = 'flex';
+        this.textContainer.style.width = '100%';
+        this.textContainer.style.flex = '1'; // Top half (50%)
+
+        // Interpreter container: Bottom half
+        this.interpreterContainer.style.display = 'flex';
+        this.interpreterContainer.style.flexDirection = 'column'; // Stack output and input
+        this.interpreterContainer.style.width = '100%';
+        this.interpreterContainer.style.flex = '1'; // Bottom half (50%)
+
+        this.textContainer.classList.remove('split-view');
+        this.textPane.style.borderRight = '';
+        this.textPane.focus();
+    }
+}
+
+
+renderPrompt() {
+    // e.g. let the shell produce the new prompt
+    this.currentPrompt = this.shell.getPrompt();
+    // Then set inputBuffer
+    this.inputBuffer.value = this.currentPrompt + ' ';
+    this.resetTextareaHeight();
+}
+
+    static setActiveInstance(instance) {
+        console.log(`Switching active instance to #${instance.instanceNumber}`);
+        this.activeInstanceIndex = this.instances.indexOf(instance);
+        this.instances.forEach(inst => {
+            inst.container.style.zIndex = inst === instance ? 10 : 1;
+        });
+
+        instance.focusBasedOnLayout();
+    }
+
+    focusBasedOnLayout() {
+        console.log(`Focusing based on layout for instance #${this.instanceNumber}, layoutState: ${this.layoutState}`);
+        if (this.layoutState === 0) {
+            console.log("Focusing inputBuffer (Interpreter only layout).");
+            this.inputBuffer.focus();
+        } else if (this.layoutState === 1) {
+            console.log("Focusing last focused element or textPane (Split layout).");
+            (this.lastFocusedElement || this.textPane).focus();
+        } else if (this.layoutState === 2) {
+            console.log("Focusing textPane (Text pane only layout).");
+            this.textPane.focus();
+        }
+    }
+
+    static cycleWindowFocus() {
+        const instances = this.instances.filter(inst => {
+            const associatedWinBox = WinBox.stack().find(win => win.body === inst.container);
+            return associatedWinBox && !associatedWinBox.min;
+        });
+
+        if (instances.length === 0) {
+            console.warn("No non-minimized instances available for cycling.");
+            return;
+        }
+
+        const currentActiveInstance = this.instances[this.activeInstanceIndex];
+        const currentFilteredIndex = instances.indexOf(currentActiveInstance);
+        const nextFilteredIndex = (currentFilteredIndex + 1) % instances.length;
+        const nextInstance = instances[nextFilteredIndex];
+
+        if (nextInstance) {
+            console.log(`Switching focus to non-minimized instance: #${nextInstance.instanceNumber}`);
+            const associatedWinBox = WinBox.stack().find(win => win.body === nextInstance.container);
+            if (associatedWinBox) {
+                associatedWinBox.focus();
+            }
+
+            this.setActiveInstance(nextInstance);
+        } else {
+            console.warn("No next instance found to focus.");
+        }
+    }
+
+    cycleFocusBetweenInputs() {
+        if (this.layoutState === 1) {
+            if (document.activeElement === this.textPane) {
+                console.log('Switching focus to inputBuffer');
+                this.inputBuffer.focus();
+            } else {
+                console.log('Switching focus to textPane');
+                this.textPane.focus();
+            }
+        }
+    }
+
+    sendTextPaneInput() {
+        const command = this.textPane.value.trim();
+        if (command) {
+            // Pass fromTextPane = true
+            this.executeCommandInCurrentMode(command, true);
+        }
+    }
+
+    saveToFile() {
+        const content = this.textPane.value;
+        const fileName = prompt("Enter file name", "file.txt") || "file.txt";
+        const blob = new Blob([content], { type: 'text/plain' });
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = fileName;
+        link.click();
+    }
+
+    loadFromFile() {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = 'text/plain';
+        input.addEventListener('change', (event) => {
+            const file = event.target.files[0];
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    this.textPane.value = e.target.result;
+                };
+                reader.readAsText(file);
+            }
+        });
+        input.click();
+    }
+
+    static minimizeCurrentWindow() {
+        const activeInstanceIndex = this.activeInstanceIndex;
+        const instances = this.instances;
+
+        if (instances.length === 0) {
+            console.warn("No instances available to minimize.");
+            return;
+        }
+
+        const currentInstance = instances[activeInstanceIndex];
+        const associatedWinBox = WinBox.stack().find(win => win.body === currentInstance.container);
+
+        if (associatedWinBox) {
+            console.log(`Minimizing window: ${associatedWinBox.id}`);
+
+            const stackIndex = this.minimizedStack.indexOf(associatedWinBox);
+            if (stackIndex !== -1) {
+                this.minimizedStack.splice(stackIndex, 1);
+            }
+
+            associatedWinBox.minimize();
+            this.minimizedStack.push(associatedWinBox);
+
+            const nextIndex = (activeInstanceIndex + 1) % instances.length;
+            const nextInstance = instances[nextIndex];
+            if (nextInstance) {
+                console.log(`Switching focus to next instance: #${nextInstance.instanceNumber}`);
+                this.setActiveInstance(nextInstance);
+            }
+        } else {
+            console.warn("No associated WinBox found for the active instance.");
+        }
+    }
+
+    static syncMinimizedStack() {
+        const currentMinimizedWindows = WinBox.stack().filter(win => win.min);
+        this.minimizedStack = this.minimizedStack.filter(win => currentMinimizedWindows.includes(win));
+        currentMinimizedWindows.forEach(win => {
+            if (!this.minimizedStack.includes(win)) {
+                this.minimizedStack.push(win);
+            }
+        });
+    }
+
+    static unminimizeMostRecent() {
+        this.syncMinimizedStack();
+        if (this.minimizedStack.length > 0) {
+            const winToRestore = this.minimizedStack.pop();
+            console.log(`Restoring most recently minimized window: ${winToRestore.id}`);
+            winToRestore.restore();
+            winToRestore.focus();
+            const associatedInstance = this.instances.find(inst => inst.container === winToRestore.body);
+            if (associatedInstance) {
+                this.setActiveInstance(associatedInstance);
+            }
+        } else {
+            console.warn("No minimized windows to unminimize.");
+        }
+    }
+
+    static toggleMaximizeCurrentWindow() {
+        const activeInstanceIndex = this.activeInstanceIndex;
+        const instances = this.instances;
+
+        if (instances.length === 0) {
+            console.warn("No instances available to maximize.");
+            return;
+        }
+
+        const currentInstance = instances[activeInstanceIndex];
+        const associatedWinBox = WinBox.stack().find(win => win.body === currentInstance.container);
+
+        if (associatedWinBox) {
+            if (!associatedWinBox.max) {
+                console.log(`Maximizing window: ${associatedWinBox.id}`);
+                associatedWinBox.maximize();
+            } else {
+                console.log(`Restoring window from maximized state: ${associatedWinBox.id}`);
+                associatedWinBox.restore();
+            }
+        } else {
+            console.warn("No associated WinBox found for the active instance.");
+        }
+    }
+
+    static toggleFullscreenCurrentWindow() {
+        const activeInstanceIndex = this.activeInstanceIndex;
+        const instances = this.instances;
+
+        if (instances.length === 0) {
+            console.warn("No instances available to fullscreen.");
+            return;
+        }
+
+        const currentInstance = instances[activeInstanceIndex];
+        const associatedWinBox = WinBox.stack().find(win => win.body === currentInstance.container);
+
+        if (associatedWinBox) {
+            if (!associatedWinBox.full) {
+                console.log(`Fullscreening window: ${associatedWinBox.id}`);
+                associatedWinBox.fullscreen();
+            } else {
+                console.log(`Restoring window from fullscreen state: ${associatedWinBox.id}`);
+                associatedWinBox.restore();
+            }
+        } else {
+            console.warn("No associated WinBox found for the active instance.");
+        }
+    }
+    
+    handleHistoryNavigation(direction) {
+    if (direction === 'up') {
+        if (this.historyIndex > 0) this.historyIndex--;
+    } else if (direction === 'down') {
+        if (this.historyIndex < this.commandHistory.length) {
+            this.historyIndex++;
+        }
+    }
+
+    // If the index is at the end, show blank (or just the prompt).
+    if (this.historyIndex >= this.commandHistory.length) {
+        // Then nothing
+        this.inputBuffer.value = this.currentPrompt + ' ';
+        this.adjustTextareaHeight();
+        return;
+    }
+
+    // Otherwise, show the stored command. We also re-prepend prompt:
+    const oldCommand = this.commandHistory[this.historyIndex] || '';
+    this.inputBuffer.value = this.currentPrompt + ' ' + oldCommand;
+    this.adjustTextareaHeight();
+}
+
+    handleKeydown(event) {
+        if (event.key === 'Enter' && event.shiftKey) {
+            console.log('Shift+Enter detected: Line break in inputBuffer');
+            event.preventDefault();
+            this.inputBuffer.value += '\n';
+            this.adjustTextareaHeight();
+        } else if (event.key === 'Enter') {
+            event.preventDefault();
+            this.processCommandFromInputBuffer();
+        } else if (event.altKey && event.key === 'ArrowUp') {
+            event.preventDefault();
+            this.handleHistoryNavigation('up');
+        } else if (event.altKey && event.key === 'ArrowDown') {
+            event.preventDefault();
+            this.handleHistoryNavigation('down');
+        }
+    }
+
+processCommandFromInputBuffer() {
+    let raw = this.inputBuffer.value;
+    if (this.currentPrompt && raw.startsWith(this.currentPrompt)) {
+        raw = raw.substring(this.currentPrompt.length);
+    }
+    const command = raw.trim();
+
+    if (command) {
+        // Add to global history
+        this.commandHistory.push(command);
+        this.historyIndex = this.commandHistory.length;
+
+        // Then execute
+        this.executeCommandInCurrentMode(command, false);
+    }
+
+    this.renderPrompt();
+}
+    
+// shell hook in
+scrollClear() {
+    // 1) Grab the visible height of the output buffer
+    const bufferHeight = this.outputBuffer.clientHeight;
+
+    // 2) Grab the line height from computed styles
+    let lineHeight = parseFloat(window.getComputedStyle(this.outputBuffer).lineHeight);
+    if (!lineHeight || isNaN(lineHeight)) {
+        // Fallback if lineHeight is empty or non-numeric
+        lineHeight = 20;
+    }
+    
+    // 3) Calculate the number of blank lines needed
+    const linesToPush = Math.ceil(bufferHeight / lineHeight);
+
+    // 4) Append that many blank lines
+    for (let i = 0; i < linesToPush; i++) {
+        this.appendOutput('');  // just an empty string
+    }
+}
+
+executeCommandInCurrentMode(command, fromTextPane = false) {
+    // Always print what the user entered
+    this.appendOutput(command, "#555555");
+
+    // If we are currently in the VM
+    if (this.currentVM) {
+        this.currentVM.exec(command);
+        if (command === "exit") {
+            this.currentVM = null;
+            // We are back to the shell now
+        }
+        return;
+    }
+
+    // Otherwise, we are in the shell
+    const result = this.shell.processCommand(command);
+    if (result && result.command === 'clear') {
+    	this.scrollClear();
+        return;
+    }
+    
+    if (result && result.command === 'forth') {
+        // The shell signaled we should boot into forth
+        // Provide an outputCallback so VM output prints immediately:
+        this.currentVM = new ForthVM((text) => {
+            this.appendOutput(text, "black");
+        });
+        return;
+    }}
+
+
+    // Handle history navigation in all modes
+navigateHistory(direction) {
+    if (direction === 'up') {
+        if (this.historyIndex > 0) {
+            this.historyIndex--;
+        }
+    } else if (direction === 'down') {
+        if (this.historyIndex < this.commandHistory.length) {
+            this.historyIndex++;
+        }
+    }
+
+    // If index is at length, it means "new empty entry"
+    if (this.historyIndex >= this.commandHistory.length) {
+        return '';
+    }
+    return this.commandHistory[this.historyIndex] || '';
+}
+
+    adjustTextareaHeight() {
+        this.inputBuffer.style.height = 'auto'; // Reset height to recalculate
+        const maxHeight = this.defaultLineHeight * this.maxRows; // Calculate max height based on rows
+        const newHeight = Math.max(this.inputBuffer.scrollHeight, this.initialHeight); // Ensure minimum height
+        this.inputBuffer.style.height = `${Math.min(newHeight, maxHeight)}px`; // Apply constraints
+    }
+
+    resetTextareaHeight() {
+        this.inputBuffer.style.height = `${this.initialHeight}px`; // Reset to the cached initial height
+    }
+
+    appendOutput(content, color = 'black') {
+        this.outputBuffer.innerHTML += `<span style="color: ${color};">${content}</span><br>`;
+        this.outputBuffer.scrollTop = this.outputBuffer.scrollHeight;
+    }
+}
+</script>
+
+<script id="global-window-logic">
+
+
+///////////// end of interpreter class
+
+///////////// global window mgr logic 
+
+        // 0 is padding to ensure we cycle back to normal state properly
+        // consider adding as part of a user settings area
+        const horizontalSplitLevels = [2 / 3, 1 / 2, 1 / 3, 1 / 4, 0];
+        const verticalSplitLevels = [1 / 2, 1 / 3, 0];
+        const cycleToNormal = true; // Change to false if no cycling back to normal is desired
+        
+        // Utility function to find the next split level
+        function getNextSplitLevel(currentLevel, levels, decrease = true) {
+            const index = levels.indexOf(currentLevel);
+            if (index === -1) return levels[0]; // Default to largest split
+            return decrease
+                ? levels[Math.min(index + 1, levels.length - 1)] // Decrease size
+                : levels[Math.max(index - 1, 0)]; // Increase size
+        }
+        
+       function updateInputBufferHeight(newLineHeight) { // not working
+            // Update the dynamically-calculated default line height
+            this.defaultLineHeight = newLineHeight;
+
+            // Reset to single-line height initially
+            this.inputBuffer.style.height = `${this.defaultLineHeight}px`;
+
+            // Trigger a recalculation for multiple lines if needed
+            this.adjustTextareaHeight();
+        }
+     
+        
+        // Function to add or remove the small-split class to target elements
+        function updateFontClass(win) {
+            const screenWidth = window.innerWidth;
+            const currentWidth = win.width / screenWidth;
+
+            const inputBuffer = win.body.querySelector('#inputBuffer');
+            const textPane = win.body.querySelector('#textPane');
+            const outputBuffer = win.body.querySelector('#outputBuffer');
+
+            // Threshold for applying small-split styling
+            const applySmallSplit = currentWidth < 0.49; //>
+
+            // Apply or remove 'small-split' on all elements
+            [textPane, outputBuffer].forEach((el) => { // removed inputBuffer here until we can figure out updateInputBufferHeight
+                if (el) {
+                    if (applySmallSplit) {
+                        el.classList.add('small-split');
+                    } else {
+                        el.classList.remove('small-split');
+                    }
+                }
+            });
+        }
+
+        // Function to adjust the window size/position based on the direction
+        function adjustWindow(win, direction) {
+            const screenWidth = window.innerWidth;
+            const screenHeight = window.innerHeight;
+
+            // Extract current dimensions and state
+            let { x, y, width, height, splitState, normalX, normalY, normalWidth, normalHeight } = win;
+            width /= screenWidth;
+            height /= screenHeight;
+            x /= screenWidth;
+            y /= screenHeight;
+
+            // Check if the window is in normal mode
+            if (!splitState || !splitState.applied) {
+                if (!splitState) {
+                    splitState = { applied: false };
+                }
+                splitState.applied = true;
+
+                // Save the current normal state if not already tracked
+                win.normalX = x;
+                win.normalY = y;
+                win.normalWidth = width;
+                win.normalHeight = height;
+
+                switch (direction) {
+                    case "left":
+                        x = 0;
+                        y = 0;
+                        width = horizontalSplitLevels[0]; // Largest horizontal split level
+                        height = 1; // Full height
+                        break;
+                    case "right":
+                        x = 1 - horizontalSplitLevels[0];
+                        y = 0;
+                        width = horizontalSplitLevels[0]; // Largest horizontal split level
+                        height = 1; // Full height
+                        break;
+                    case "up":
+                        y = 0;
+                        x = 0;
+                        height = verticalSplitLevels[0]; // Largest vertical split level
+                        width = 1; // Full width
+                        break;
+                    case "down":
+                        y = 1 - verticalSplitLevels[0];
+                        x = 0;
+                        height = verticalSplitLevels[0]; // Largest vertical split level
+                        width = 1; // Full width
+                        break;
+                }
+            } else {
+                // Determine the edge to adjust and whether to resize or move
+                switch (direction) {
+                    case "left":
+                        if (x === 0) {
+                            width = getNextSplitLevel(width, horizontalSplitLevels, true); // Decrease width
+                            if (width === horizontalSplitLevels[horizontalSplitLevels.length - 1] && cycleToNormal) {
+                                splitState.applied = false; // Return to normal
+                                x = win.normalX;
+                                y = win.normalY;
+                                width = win.normalWidth;
+                                height = win.normalHeight;
+                                break;
+                            }
+                        } else {
+                            x = Math.max(x - width, 0); // Move left if space allows
+                        }
+                        break;
+                    case "right":
+                        if (x + width >= 1) {
+                            width = getNextSplitLevel(width, horizontalSplitLevels, true); // Decrease width
+                            x = 1 - width; // Align right edge
+                            if (width === horizontalSplitLevels[horizontalSplitLevels.length - 1] && cycleToNormal) {
+                                splitState.applied = false; // Return to normal
+                                x = win.normalX;
+                                y = win.normalY;
+                                width = win.normalWidth;
+                                height = win.normalHeight;
+                                break;
+                            }
+                        } else {
+                            x = Math.min(x + width, 1 - width); // Move right if space allows
+                        }
+                        break;
+                    case "up":
+                        if (y === 0) {
+                            height = getNextSplitLevel(height, verticalSplitLevels, true); // Decrease height
+                            if (height === verticalSplitLevels[verticalSplitLevels.length - 1] && cycleToNormal) {
+                                splitState.applied = false; // Return to normal
+                                x = win.normalX;
+                                y = win.normalY;
+                                width = win.normalWidth;
+                                height = win.normalHeight;
+                                break;
+                            }
+                        } else {
+                            y = Math.max(y - height, 0); // Move up if space allows
+                        }
+                        break;
+                    case "down":
+                        if (y + height >= 1) {
+                            height = getNextSplitLevel(height, verticalSplitLevels, true); // Decrease height
+                            y = 1 - height; // Align bottom edge
+                            if (height === verticalSplitLevels[verticalSplitLevels.length - 1] && cycleToNormal) {
+                                splitState.applied = false; // Return to normal
+                                x = win.normalX;
+                                y = win.normalY;
+                                width = win.normalWidth;
+                                height = win.normalHeight;
+                                break;
+                            }
+                        } else {
+                            y = Math.min(y + height, 1 - height); // Move down if space allows
+                        }
+                        break;
+                }
+            }
+
+            // Apply the changes
+            win.move(x * screenWidth, y * screenHeight);
+            win.resize(width * screenWidth, height * screenHeight);
+            win.splitState = splitState; // Save split state
+            
+            updateFontClass(win);
+        }
+            
+        
+
+        // Key handler for resizing/moving windows
+        document.addEventListener("keydown", (event) => {
+            const currentWin = WinBox.stack().find((win) => win.focused);
+            if (event.altKey) {
+                event.preventDefault();
+                switch (event.key) {
+                    case "3": // Window focus cycling
+                        event.preventDefault();
+                        InterpreterInterface.cycleWindowFocus();
+                        break;
+                    case "h":
+                        adjustWindow(currentWin, "left");
+                        break;
+                    case "l":
+                        adjustWindow(currentWin, "right");
+                        break;
+                    case "k":
+                        adjustWindow(currentWin, "up");
+                        break;
+                    case "j":
+                        adjustWindow(currentWin, "down");
+                        break;
+                    case "m": // Minimize or unminimize
+                        event.preventDefault();
+                        InterpreterInterface.minimizeCurrentWindow();
+                        break;
+                    case "r": // restore
+                        event.preventDefault();
+                        InterpreterInterface.unminimizeMostRecent();
+                        break;
+                    case "b": // maximize
+                        event.preventDefault();
+                        InterpreterInterface.toggleMaximizeCurrentWindow();
+                        break;
+                    case "f": // fullscreen
+                        event.preventDefault();
+                        InterpreterInterface.toggleFullscreenCurrentWindow();
+                        break;
+                    case "n": // Create a new window
+                        event.preventDefault();
+                        openProject('interpreter');
+                        break;
+                }
+            }
+        });
+
+////////////////////////////// window creation
+ 
+function openProject(projectId) {
+    const template = document.getElementById(projectId);
+    if (!template) {
+        console.error(`Template for projectId ${projectId} not found.`);
+        return;
+    }
+
+    const instanceNumber = InterpreterInterface.instances.length + 1; // Determine instance number
+
+    const win = new WinBox({
+        title: `#${instanceNumber}`,
+        html: template.innerHTML,
+        width: "60%",
+        height: "80%",
+        max: false, // TODO: messes with interaction layer positioning
+        x: "center",
+        y: "center",
+        background: "#333",
+        onresize: function (width, height) {
+            // Check if the width exceeds 95% of the viewport width
+            const viewportWidth = window.innerWidth;
+            const isMaximized = width / viewportWidth > 0.95;
+
+            const container = this.body.querySelector('.window-container');
+            if (isMaximized) {
+                container.classList.add('maximized');
+            } else {
+                container.classList.remove('maximized');
+            }
+        },
+        onclose: () => {
+            // Remove the instance when closed
+            InterpreterInterface.instances = InterpreterInterface.instances.filter(
+                (instance) => instance.instanceNumber !== instanceNumber
+            );
+        },
+    });
+
+    const interpreter = new Interpreter();
+    const associatedInterface = new InterpreterInterface(win.body, interpreter, instanceNumber);
+    win.associatedInterface = associatedInterface; // Explicitly associate the InterpreterInterface with this WinBox
+    associatedInterface.inputBuffer.focus();
+    console.log(`Created window ${win.id} with associated interface`, associatedInterface);
+}
+
+</script>
+
+<template id="ideas">
+    <style>
+        :root {
+            --ideas-fontsize: 20px; /* Base font size */
+            --ideas-zoom: 1; /* Global zoom level */
+        }
+        
+        .ideas-container {
+            --ideas-scaled-fontsize: calc(var(--ideas-fontsize) * var(--ideas-zoom));
+            --ideas-lineheight: calc(var(--ideas-scaled-fontsize) * 1.2);
+            --ideas-padding: calc(var(--ideas-scaled-fontsize) * 0.5);
+            --ideas-scrollbar-width: calc(var(--ideas-scaled-fontsize) * 0.25);
+            --ideas-border-radius: calc(var(--ideas-scaled-fontsize) * 0.2);
+            border: 2px solid #000;
+            outline-offset: 3px;
+            box-sizing: border-box;
+
+            font-family: monospace;
+            font-size: var(--ideas-scaled-fontsize);
+            line-height: var(--ideas-lineheight);
+            background: #FFFFFF;
+            height: 100%;
+            color: #000;
+        }
+        
+        .wb-body:has(.ideas-container) {
+            overflow: hidden !important; /* Hide wb-body scrollbar */
+        }
+
+        .ideas-window-container {
+            display: flex;
+            flex-direction: column;
+            width: 100%;
+            height: 100%;
+            box-sizing: border-box;
+            overflow-y: auto; /* Enable scrolling */
+            padding: var(--ideas-padding);
+        }
+
+        /* Scrollbar Styling for Ideas Content */
+        .ideas-window-container::-webkit-scrollbar {
+            width: var(--ideas-scrollbar-width);
+            height: var(--ideas-scrollbar-width);
+        }
+
+        .ideas-window-container::-webkit-scrollbar-thumb {
+            background-color: rgba(0, 0, 0, 0.1);
+            border-radius: var(--ideas-border-radius);
+        }
+
+        .ideas-window-container::-webkit-scrollbar-thumb:hover {
+            background-color: rgba(0, 0, 0, 0.4);
+            transition: background-color 0.3s ease;
+        }
+
+        .ideas-window-container::-webkit-scrollbar-track {
+            background-color: transparent;
+        }
+
+        /* Styling for TODO Content */
+        .ideas-window-container h3 {
+            margin: 0;
+            font-size: calc(var(--ideas-scaled-fontsize) * 1.2);
+            font-weight: bold;
+        }
+
+        .ideas-window-container p {
+            margin: 0.5em 0;
+        }
+
+        .ideas-window-container ul {
+            list-style: none;
+            padding-left: 1em;
+        }
+
+        .ideas-window-container li::before {
+            content: "-";
+            font-size: 28px;
+        }
+
+        .ideas-window-container li {
+            margin: 0.25em 0;
+        }
+    </style>
+
+    <div class="ideas-container">
+        <div class="ideas-window-container">
+            <h3>Ideas/Todo</h3>
+            <p>Working on:</p>
+            <ul>
+
+            </ul>
+            <p>Ideas:</p>
+            <ul>
+<ul>a shell:</ul>
+<li>leaf to forth or trunk to forth?</li>
+<li>considering adding a vocab for a shell, which requires
+<li>a vocab system</li>
+<li>considering adding non desktop metaphor</li>
+<li>based on set theory/graph theory/tagging?</li>
+</ul><ul>
+<li>types:</li>
+<li>word -> normal forth words, primitives and user-defined</li>
+<li>alt:</li>
+  <li>lex, symbol, token, rune, glyph, sigil, key, morph (cmd, def)
+<li>expression -> phrase -> sequence -> something like a file -> sets of words in a vocab (grouping mechanisms?)</li>
+<li>alt:</li>
+<li>  formula, seuence, construct, assembly, compound, phrase, pattern, syntax (expr, eval)</li>
+<li>vocab -> vocabulary -> a set of available words</li>
+alt:</li>
+<li>  lexicon, dictionary, thesaurus, glossary, repertoire, terminology, nomenclature, phrasebook (cmds, set) (these are terrible)</li>
+<li>grammar -> a parser -> a behavior for parsing text</li>
+<li>alt:</li>
+  <li>syntax, parser, structure, ruleset, framework, schema, protocol, lexis (parse, syntax)</li>
+<li>file -> a range of data</li>
+<li>alt:</li>
+<li>  node, entity, slice, datum, record, piece, fragment, item (file, doc)</li>
+<li>directory -> (exclusive sets, hierarchical groupings of files)</li>
+<li>alt:</li>
+ <li> folder, hierarchy, cluster, domain, realm, zone, section, branch (dir, folder)</li>
+<li>tag -> non-exclusive metadata words attached to a file</li>
+<li>alt:</li>
+  <li>label, marker, flag, keyword, descriptor, meta, attribute, identifier (tag, attr)</li>
+<li>group -> groups of files defined by folder, tags, or links
+<li>alt:</li>
+  <li>collection, set, bundle, assembly, cluster, aggregate, cohort, array (group, bundle)</li>
+
+<li>CRUD:</li>
+<li>bind (distinct from colon definitions?) - I'm especially interested in the way in which strings can be attached to objects, or if some promoted type (sigils? symbols? runes? what are these) is required to assign a set of characters to an object
+<li>can colon definitions be used to abstract the concept of a file, like : file-name ...statements... ; and then we just need a way of viewing and editing colon definitions?</li>
+<li>alt:</li>
+  <li>attach, link, associate, connect, couple, pair, tie, merge (bind, ln)</li>
+<li>- consider: using a symbol like system ('name) allows for versatile referencing across diff types (files, groups, tags)</li>  
+<li>- symbols can offer performance benefits and avoid naming collisions</li>
+<li>- abstracting files via colon definitions can streamline file manipulations, treating them as definable and editable code blocks, viewing and editing colon definitions would require commands that can interpret and modify these definitions, enhancing flexibility
+</li>
+<li>create/delete (file/node/set/tag)</li>
+<li>alt:</li>
+<li>  init, spawn, forge, generate, construct, build, produce, instantiate (touch, mkdir)</li>
+<li>add (hierarchy/set)</li>
+<li>alt:</li>
+  <li>insert, append, include, attach, merge, integrate, conjoin, combine (add, copy)</li>
+move (hierarchy/set)</li>
+<li>alt:</li>
+  shift, transfer, relocate, reassign, translocate, port, redirect, navigate</li>
+<li>remove (hierachy/set)</li></li>
+<li>alt:</li>
+  remove, erase, discard, purge, eliminate, obliterate, excise, clear (rm, rmdir)</li>
+<li>rename</li>
+<li>alt:</li>
+  <li>relable, rekey, retag, alias, title, designation, moniker, tagify</li>
+<li>link (file->file, file->tag, tag->file, tag->tag)</li>
+<li>alt:</li>
+  <li>associate, bind, connect, pair, bridge, tie, couple, affiliate (ln, symlink)</li>
+<li>join (sets)</li>
+<li>alt:</li>
+  <li>merge, combine, fuse, unite, blend, consolidate, integrate, synthesize (cat, join)</li>
+<li>unlink (tag)</li>
+<li>alt:</li>
+  <li>dissociate, detach, sever, break, split, disconnect, unpair, decouple</li>
+
+<li>QUERY:</li>
+<li>intersect (between hierarchy/set)</li>
+<li>alt:</li>
+  <li>common, overlap, share, converge, meet, cross, meet, cross, collide, blend (grep, comm?)</li>
+<li>diff (")</li>
+<li>alt:</li>
+  <li>compare, contrast, delta, variance, discrepancy, deviate, diverge, distinguish</li>
+<li>contains (is file present?, is string present??)</li>
+<li>alt:</li>
+  <li>includes, has, holds, embodies, encompasses, features, encloses, incorporates</li>
+<li>list/view (in given context, or... visualize graph/tree)</li>
+<li>alt:</li>
+  <li>display, show, enumuerate, catalog, detail, outline, reveal, present</li>
+<li>path (find path btwn nodes)</li>
+<li>alt:</li>
+  <li>route, trail, journey, way, track, connection, course, <li>navigate (pwd, cd)</li>
+<li>linked (list neighbors):</li>
+<li>alt:</li>
+<li>connected, associated, tied, bound, joined, related, coupled, interconnected</li>
+<li>traverse (recurse over graph)</li>
+<li>alt: navigate, explore, wal, scan, browse, survey, journey, tour (find, grep)</li>
+<li>cycle (lists circular edges in a graph)</li>
+<li>alt: loop, ring, orbit, circle, circuit, cyclecheck, loopdetect, recursion, check</li>
+
+<li>line editor?</li>
+
+<li>clickable directories, links?</li>
+<li>version control baked into state?</li>
+<li>image based export?</li> 	
+                <li>Input buffer resize working on small split</li>
+                <li>Header hover alignment - fixed</li>
+                <li>Top middle ix area for change layout - kinda working</li>
+                <li>Dynamic keybind mgr</li>
+                <li>Bottom-left click for min - works - need cursor change</li>
+                <li>Top-right click for max - works - need cursor change?</li>
+                <li>Fix forth line break after output, before next input</li>
+                <li>Framebuffer/display/etc.</li>
+                <li>Forth mode/vm</li>
+                <li>Modal mode/vm</li>
+                <li>Scheme mode/vm</li>
+                <li>Box-line data ports</li>
+                <li>Integrate coil</li>
+                <li>Save/load workspace image</li>
+                <li>Draw new win boundaries to create</li>
+                <li>Window nesting</li>
+                <li>Desktop mechanics → win to icon, crud icons = crud wins</li>
+                <li>Filesystem</li>
+                <li>Tabbed text editor</li>
+                <li>Evaluate forth vm</li>
+                <li>Uxn??</li>
+                <li>Forth vocabs</li>
+                <li>Incremental parser generator/PLT playground</li>
+                <li>Inf canv? Outliner?</li>
+                <li>P5? Port to elm? Other silly bloaty webshit?</li>
+                <li>Codefolding textPane</li>
+            </ul>
+        </div>
+    </div>
+</template>
+
+
+<script id="tasklist">
+
+let todoWindow = null; // Store the reference to the window instance
+
+function openTODO() {
+    const template = document.getElementById('ideas');
+
+    // Check if the window already exists
+    if (todoWindow && !todoWindow.closed) {
+        // Close the window if it exists
+        todoWindow.close();
+        console.log("TODO window closed.");
+        todoWindow = null; // Clear the reference
+        return;
+    }
+
+    // Create a new TODO window
+    const instanceNumber = document.querySelectorAll('.winbox').length + 1;
+
+    todoWindow = new WinBox({
+        title: `ideas`,
+        html: template.innerHTML, // Load the template content
+        width: "30%",
+        height: "45%",
+        x: "55%", // Opens slightly offset to the left
+        y: "15%", // Opens slightly lower on the screen
+        onclose: () => {
+            todoWindow = null; // Clear the reference when closed
+        },
+    });
+    const textPane = todoWindow.body.querySelector("#textPane");
+    if (textPane) {
+        textPane.focus();
+    }
+}
+
+
+openProject('interpreter');
+
+    </script>
+
+    <div class="root-space">
+       <button class="icon" onclick="openProject('interpreter')">+</button>
+       <button class="icon" onclick="openTODO()">?</button>
+    </div>
+</body>
+</html>
